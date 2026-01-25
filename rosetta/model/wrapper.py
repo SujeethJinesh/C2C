@@ -348,8 +348,8 @@ class RosettaModel(nn.Module):
                 ).past_key_values        
         fused_kv_cache = clone_kv_cache(base_output_kv_cache)
 
-                                quantized_source_cache = {}
-                                for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
+        quantized_source_cache = {}
+        for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
             base_key_cache, base_value_cache = base_output_kv_cache[target_layer_idx]
             new_base_key_cache = base_key_cache[:, :, -new_length:, :]
             new_base_value_cache = base_value_cache[:, :, -new_length:, :]
@@ -360,10 +360,34 @@ class RosettaModel(nn.Module):
             projected_kv_list = []
             source_kv_list = []
             for source_model_layer_idx, projector_idx in pair_list:
-                source_key_cache, source_value_cache = source_output_kv_cache[source_model_layer_idx]
-                new_source_key_cache = source_key_cache[:, :, -new_length:, :]
-                new_source_value_cache = source_value_cache[:, :, -new_length:, :]
-                new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                if source_model_layer_idx in quantized_source_cache:
+                    new_source_kv_cache = quantized_source_cache[source_model_layer_idx]
+                else:
+                    source_key_cache, source_value_cache = source_output_kv_cache[source_model_layer_idx]
+                    new_source_key_cache = source_key_cache[:, :, -new_length:, :]
+                    new_source_value_cache = source_value_cache[:, :, -new_length:, :]
+                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                    new_source_kv_cache, q_info = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
+                    if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
+                        stats = self._kv_quant_stats
+                        stats["count"] += 1
+                        k_scale = q_info["k_scale"]
+                        v_scale = q_info["v_scale"]
+                        stats["k_scale_min"] = (
+                            k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                        )
+                        stats["k_scale_max"] = (
+                            k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
+                        )
+                        stats["k_scale_mean_sum"] += k_scale["mean"]
+                        stats["v_scale_min"] = (
+                            v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
+                        )
+                        stats["v_scale_max"] = (
+                            v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
+                        )
+                        stats["v_scale_mean_sum"] += v_scale["mean"]
+                    quantized_source_cache[source_model_layer_idx] = new_source_kv_cache
                 projected_key, projected_value = self.projector_list[projector_idx].forward(
                     new_source_kv_cache, # tuple of (key, value), each of shape (B, N, H, D)
                     new_base_kv_cache
@@ -482,8 +506,14 @@ class RosettaModel(nn.Module):
                 if self.include_response:
                     self.remove_hooks(hook_handlers)
 
-                self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = clone_kv_cache(base_output_kv_cache)
-                self.kv_cache_dict[self.base_model_idx][1] = clone_kv_cache(source_output_kv_cache)
+                if self.base_model_idx not in self.kv_cache_dict:
+                    self.kv_cache_dict[self.base_model_idx] = {}
+                if self.include_response:
+                    self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = clone_kv_cache(base_output_kv_cache)
+                    self.kv_cache_dict[self.base_model_idx][1] = clone_kv_cache(source_output_kv_cache)
+                else:
+                    # When include_response is False, rely on the base model forward output.
+                    self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = clone_kv_cache(output.past_key_values)
 
             else:
 
@@ -560,6 +590,7 @@ class RosettaModel(nn.Module):
                     sharer_mask = kv_cache_index[i][0][0][0].item()
                     if sharer_mask > 0:
                         base_cache = clone_kv_cache(curr_base_kv_cache)
+                        quantized_source_cache = {}
 
                         # For parallel mode, accumulate residuals for each target layer
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
