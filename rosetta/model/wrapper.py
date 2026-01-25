@@ -83,6 +83,18 @@ class RosettaModel(nn.Module):
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
         self.multi_source_fusion_mode = multi_source_fusion_mode
         self.kv_quant_config = kv_quant_config or {"enabled": False}
+        if self.kv_quant_config.get("collect_stats", False):
+            self._kv_quant_stats = {
+                "count": 0,
+                "k_scale_min": None,
+                "k_scale_max": None,
+                "k_scale_mean_sum": 0.0,
+                "v_scale_min": None,
+                "v_scale_max": None,
+                "v_scale_mean_sum": 0.0,
+            }
+        else:
+            self._kv_quant_stats = None
 
     @property
     def device(self):
@@ -159,6 +171,27 @@ class RosettaModel(nn.Module):
 
     def set_kv_quant_config(self, kv_quant_config: Optional[dict]):
         self.kv_quant_config = kv_quant_config or {"enabled": False}
+        if self.kv_quant_config.get("collect_stats", False):
+            self._kv_quant_stats = {
+                "count": 0,
+                "k_scale_min": None,
+                "k_scale_max": None,
+                "k_scale_mean_sum": 0.0,
+                "v_scale_min": None,
+                "v_scale_max": None,
+                "v_scale_mean_sum": 0.0,
+            }
+        else:
+            self._kv_quant_stats = None
+
+    def get_kv_quant_stats(self):
+        if self._kv_quant_stats is None:
+            return None
+        stats = dict(self._kv_quant_stats)
+        if stats["count"] > 0:
+            stats["k_scale_mean"] = stats["k_scale_mean_sum"] / stats["count"]
+            stats["v_scale_mean"] = stats["v_scale_mean_sum"] / stats["count"]
+        return stats
 
     @staticmethod
     def load_json(file_name):
@@ -315,7 +348,8 @@ class RosettaModel(nn.Module):
                 ).past_key_values        
         fused_kv_cache = clone_kv_cache(base_output_kv_cache)
 
-        for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
+                                quantized_source_cache = {}
+                                for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
             base_key_cache, base_value_cache = base_output_kv_cache[target_layer_idx]
             new_base_key_cache = base_key_cache[:, :, -new_length:, :]
             new_base_value_cache = base_value_cache[:, :, -new_length:, :]
@@ -552,7 +586,6 @@ class RosettaModel(nn.Module):
 
                                 projected_kv_list = []
                                 source_kv_list = []
-                                quantized_source_cache = {}
                                 for source_model_layer_idx, projector_idx in pair_list:
                                     if source_model_layer_idx in quantized_source_cache:
                                         new_source_kv_cache = quantized_source_cache[source_model_layer_idx]
@@ -561,7 +594,26 @@ class RosettaModel(nn.Module):
                                         new_source_key_cache = source_key_cache[:, :, start:end, :]
                                         new_source_value_cache = source_value_cache[:, :, start:end, :]
                                         new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
-                                        new_source_kv_cache, _ = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
+                                        new_source_kv_cache, q_info = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
+                                        if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
+                                            stats = self._kv_quant_stats
+                                            stats["count"] += 1
+                                            k_scale = q_info["k_scale"]
+                                            v_scale = q_info["v_scale"]
+                                            stats["k_scale_min"] = (
+                                                k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                                            )
+                                            stats["k_scale_max"] = (
+                                                k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
+                                            )
+                                            stats["k_scale_mean_sum"] += k_scale["mean"]
+                                            stats["v_scale_min"] = (
+                                                v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
+                                            )
+                                            stats["v_scale_max"] = (
+                                                v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
+                                            )
+                                            stats["v_scale_mean_sum"] += v_scale["mean"]
                                         quantized_source_cache[source_model_layer_idx] = new_source_kv_cache
                                     projected_key, projected_value = self.projector_list[projector_idx].forward(
                                         new_source_kv_cache,

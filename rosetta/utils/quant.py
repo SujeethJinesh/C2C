@@ -50,11 +50,20 @@ def quantize_dequantize(
     return x_hat, scale
 
 
+def _summarize_scale(scale: torch.Tensor) -> Dict[str, float]:
+    return {
+        "min": float(scale.min().item()),
+        "max": float(scale.max().item()),
+        "mean": float(scale.mean().item()),
+    }
+
+
 def quantize_kv(
     kv: Tuple[torch.Tensor, torch.Tensor],
     scheme: str = "int8",
     axis: str = "head",
     eps: float = 1e-6,
+    collect_stats: bool = False,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
     if scheme not in SUPPORTED_SCHEMES:
         raise ValueError(f"Unsupported kv_quant_scheme: {scheme}")
@@ -63,12 +72,13 @@ def quantize_kv(
     key, value = kv
     qk, k_scale = quantize_dequantize(key, num_bits=num_bits, axis=axis, eps=eps)
     qv, v_scale = quantize_dequantize(value, num_bits=num_bits, axis=axis, eps=eps)
-    info = {
+    info: Dict[str, torch.Tensor] = {
         "scheme": scheme,
         "axis": axis,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
     }
+    if collect_stats:
+        info["k_scale"] = _summarize_scale(k_scale)
+        info["v_scale"] = _summarize_scale(v_scale)
     return (qk, qv), info
 
 
@@ -82,4 +92,11 @@ def maybe_quantize_kv(
     scheme = config.get("scheme", "int8")
     axis = config.get("axis", "head")
     eps = config.get("eps", 1e-6)
-    return quantize_kv(kv, scheme=scheme, axis=axis, eps=eps)
+    collect_stats = config.get("collect_stats", False)
+
+    key, value = kv
+    if key.numel() == 0 or value.numel() == 0:
+        info = {"scheme": scheme, "axis": axis, "skipped": "empty"} if collect_stats else None
+        return kv, info
+
+    return quantize_kv(kv, scheme=scheme, axis=axis, eps=eps, collect_stats=collect_stats)

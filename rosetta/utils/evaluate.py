@@ -549,10 +549,12 @@ def load_oracle_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[st
         projector_list.append(proj)
     
     # Initialize Rosetta model
+    kv_quant_config = rosetta_config.get("kv_quant_config")
     rosetta_model = OracleRosettaModel(
         model_list=[slm_model, llm_model],
         base_model_idx=0,
         projector_list=projector_list,
+        kv_quant_config=kv_quant_config,
     ).to(device).eval()
 
     # Load projector mapping configs

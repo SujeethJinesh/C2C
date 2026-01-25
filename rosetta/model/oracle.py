@@ -7,6 +7,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import json
 
 from rosetta.model.projector import Projector
+from rosetta.utils.quant import maybe_quantize_kv
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
 try:
@@ -20,7 +21,13 @@ class OracleRosettaModel(nn.Module):
     """
     Drop in replacement for the standard transformers LLM models, like Qwen3ForCausalLM
     """
-    def __init__(self, model_list: List[PreTrainedModel], base_model_idx = 0, projector_list: List[Projector] = []):
+    def __init__(
+        self,
+        model_list: List[PreTrainedModel],
+        base_model_idx = 0,
+        projector_list: List[Projector] = [],
+        kv_quant_config: Optional[dict] = None,
+    ):
         super().__init__()
         # model list: a list of model, model 0 by default is the base model
         # projector list: a list of projector
@@ -38,6 +45,7 @@ class OracleRosettaModel(nn.Module):
         self.projector_dict = {}
         self.kv_cache_dict = {}
         self._generation_hook_handlers = []
+        self.kv_quant_config = kv_quant_config or {"enabled": False}
 
     @property
     def device(self):
@@ -111,6 +119,9 @@ class OracleRosettaModel(nn.Module):
                 return self.projector_list[projector_id]
         # Fallback: return the first projector
         return self.projector_list[pair_list[0][1]]
+
+    def set_kv_quant_config(self, kv_quant_config: Optional[dict]):
+        self.kv_quant_config = kv_quant_config or {"enabled": False}
 
     @staticmethod
     def load_json(file_name):
@@ -277,6 +288,7 @@ class OracleRosettaModel(nn.Module):
                 if self.base_model_idx in self.projector_dict:
                     source_model_idx = kv_cache_index[i][0][0][0].item()  # Get the source model index from the kv_cache_index
                     if source_model_idx != -1:
+                        quantized_source_cache = {}
                         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
                             base_key_cache, base_value_cache = curr_base_kv_cache[target_layer_idx]
                             new_base_key_cache = base_key_cache[:, :, start:end, :]
@@ -288,10 +300,15 @@ class OracleRosettaModel(nn.Module):
                             projected_kv_list = []
                             source_kv_list = []
                             for source_model_layer_idx, projector_idx in pair_list:
-                                source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
-                                new_source_key_cache = source_key_cache[:, :, start:end, :]
-                                new_source_value_cache = source_value_cache[:, :, start:end, :]
-                                new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                if source_model_layer_idx in quantized_source_cache:
+                                    new_source_kv_cache = quantized_source_cache[source_model_layer_idx]
+                                else:
+                                    source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
+                                    new_source_key_cache = source_key_cache[:, :, start:end, :]
+                                    new_source_value_cache = source_value_cache[:, :, start:end, :]
+                                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                    new_source_kv_cache, _ = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
+                                    quantized_source_cache[source_model_layer_idx] = new_source_kv_cache
                                 projected_key, projected_value = self.projector_list[projector_idx].forward(
                                     new_source_kv_cache, # tuple of (key, value), each of shape (B, N, H, D)
                                     new_base_kv_cache
