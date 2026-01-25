@@ -11,6 +11,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import json
 
 from rosetta.model.projector import Projector
+from rosetta.utils.quant import maybe_quantize_kv
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
 try:
@@ -47,7 +48,15 @@ class RosettaModel(nn.Module):
     """
     Drop in replacement for the standard transformers LLM models, like Qwen3ForCausalLM
     """
-    def __init__(self, model_list: List[PreTrainedModel], base_model_idx = 0, projector_list: List[Projector] = [], include_response: bool = False, multi_source_fusion_mode: str = "parallel"):
+    def __init__(
+        self,
+        model_list: List[PreTrainedModel],
+        base_model_idx = 0,
+        projector_list: List[Projector] = [],
+        include_response: bool = False,
+        multi_source_fusion_mode: str = "parallel",
+        kv_quant_config: Optional[dict] = None,
+    ):
         super().__init__()
         # model list: a list of model, model 0 by default is the base model
         # projector list: a list of projector
@@ -73,6 +82,7 @@ class RosettaModel(nn.Module):
         if multi_source_fusion_mode not in ["sequential", "parallel"]:
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
         self.multi_source_fusion_mode = multi_source_fusion_mode
+        self.kv_quant_config = kv_quant_config or {"enabled": False}
 
     @property
     def device(self):
@@ -146,6 +156,9 @@ class RosettaModel(nn.Module):
                 return self.projector_list[projector_id]
         # Fallback: return the first projector
         return self.projector_list[pair_list[0][1]]
+
+    def set_kv_quant_config(self, kv_quant_config: Optional[dict]):
+        self.kv_quant_config = kv_quant_config or {"enabled": False}
 
     @staticmethod
     def load_json(file_name):
@@ -539,11 +552,17 @@ class RosettaModel(nn.Module):
 
                                 projected_kv_list = []
                                 source_kv_list = []
+                                quantized_source_cache = {}
                                 for source_model_layer_idx, projector_idx in pair_list:
-                                    source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
-                                    new_source_key_cache = source_key_cache[:, :, start:end, :]
-                                    new_source_value_cache = source_value_cache[:, :, start:end, :]
-                                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                    if source_model_layer_idx in quantized_source_cache:
+                                        new_source_kv_cache = quantized_source_cache[source_model_layer_idx]
+                                    else:
+                                        source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
+                                        new_source_key_cache = source_key_cache[:, :, start:end, :]
+                                        new_source_value_cache = source_value_cache[:, :, start:end, :]
+                                        new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                        new_source_kv_cache, _ = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
+                                        quantized_source_cache[source_model_layer_idx] = new_source_kv_cache
                                     projected_key, projected_value = self.projector_list[projector_idx].forward(
                                         new_source_kv_cache,
                                         new_base_kv_cache

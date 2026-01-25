@@ -433,6 +433,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
     # Get multi-source fusion mode from config (default to "sequential" for backward compatibility)
     multi_source_fusion_mode = rosetta_config.get("multi_source_fusion_mode", "sequential")
     include_response = rosetta_config.get("include_response", False)
+    kv_quant_config = rosetta_config.get("kv_quant_config")
     
     rosetta_model = RosettaModel(
         model_list=model_list,
@@ -440,6 +441,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
         projector_list=projector_list,
         include_response=include_response,
         multi_source_fusion_mode=multi_source_fusion_mode,
+        kv_quant_config=kv_quant_config,
     ).to(device).eval()
 
     # Load projector mapping configs from each LLM's checkpoint directory
@@ -719,4 +721,3 @@ def generate_answer_with_generate(model, tokenizer, prompt: str, device: torch.d
     gen_length = generated_ids.shape[0]
 
     return pred, probs, input_length, gen_length, content
-
