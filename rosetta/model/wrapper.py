@@ -481,6 +481,9 @@ class RosettaModel(nn.Module):
             prefill_position_ids = position_ids[:, start:end] if position_ids is not None else None
             prefill_labels = labels[:, start:end] if labels is not None else None
 
+            if prefill_input_ids is not None and prefill_input_ids.shape[1] == 0:
+                continue
+
             if i == num_sections - 1:
 
                 if self.include_response:
