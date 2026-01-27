@@ -1048,60 +1048,6 @@ class UnifiedEvaluator:
         elif self.dataset_name == "math-500":
             rule_evaluator = MATH500Evaluator()
 
-        def format_prompt(example):
-            if self.dataset_name == "mmmlu":
-                return self._format_mmmlu_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    subject=subject,
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "mmlu-redux":
-                return self._format_mmlu_redux_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "gpqa":
-                return self._format_gpqa_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name in ["math-500", "gsm8k"]:
-                return self._format_math_problem_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "openbookqa":
-                return self._format_openbookqa_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "ai2-arc":
-                return self._format_ai2_arc_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "mmlu-pro":
-                return self._format_mmlu_pro_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "ceval":
-                return self._format_ceval_example(
-                    example,
-                    use_cot=self.eval_config["use_cot"],
-                    use_template=self.eval_config["use_template"],
-                )
-            if self.dataset_name == "longbench":
-                return self._format_longbench_example(example, tokenizer)
-            raise ValueError(f"Unknown dataset: {self.dataset_name}")
-
         cors = []
         all_probs = []
         length_stats = []
@@ -1109,204 +1055,6 @@ class UnifiedEvaluator:
         total_count = 0
         skip_count = 0
         printed_example = False
-
-        # Sampling configuration
-        sample_interval = self.eval_config.get("sample_interval", 1)
-        sample_indices = list(range(0, len(test_data), sample_interval))
-
-        # Apply virtual split window for datasets without native subjects
-        if is_virtual_split and total_splits > 1:
-            n = len(test_data)
-            start = (split_index * n) // total_splits
-            end = ((split_index + 1) * n) // total_splits
-            sample_indices = [i for i in sample_indices if start <= i < end]
-        limit = self.eval_config.get("limit", None)
-        if isinstance(limit, int) and limit > 0:
-            # Use first N indices
-            sample_indices = sample_indices[:limit]
-        elif isinstance(limit, (list, tuple)) and len(limit) == 2:
-            # Treat as [start, end) range on original indices
-            start, end = limit
-            start = 0 if start is None else int(start)
-            end = len(test_data) if end is None else int(end)
-            sample_indices = [i for i in sample_indices if start <= i < end]
-
-        batch_size = int(self.eval_config.get("batch_size", 1) or 1)
-        use_batch = (
-            batch_size > 1
-            and self.eval_config.get("answer_method") == "generate"
-            and model_type in ["hf", "qwen"]
-            and self.dataset_name not in ["math-500", "gsm8k", "longbench"]
-        )
-
-        if use_batch:
-            for start_idx in range(0, len(sample_indices), batch_size):
-                batch_indices = sample_indices[start_idx:start_idx + batch_size]
-                batch_examples = []
-                batch_prompts = []
-
-                for i in batch_indices:
-                    example = test_data[i]
-                    true_answer = self.parse_answer(example)
-                    if true_answer is None:
-                        skip_count += 1
-                        continue
-                    prompt = format_prompt(example)
-                    batch_examples.append((i, example, prompt, true_answer))
-                    batch_prompts.append(prompt)
-
-                if not batch_examples:
-                    continue
-
-                messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
-                texts = [
-                    tokenizer.apply_chat_template(
-                        [message],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=False,
-                    )
-                    for message in messages
-                ]
-
-                tokenized = tokenizer(texts, return_tensors="pt", padding=True).to(device)
-                max_len = tokenized["input_ids"].shape[1]
-                input_lengths = tokenized["attention_mask"].sum(dim=1).tolist()
-
-                def _generate_call():
-                    return model.generate(**tokenized, **self.generation_config)
-                outputs, latency_ms = self._measure_latency_ms(_generate_call, device)
-
-                for b_idx, (i, example, prompt, true_answer) in enumerate(batch_examples):
-                    generated_ids = outputs[b_idx][max_len:]
-                    content = tokenizer.decode(generated_ids, skip_special_tokens=True).strip("\n")
-                    pred = self.extract_predicted_answer(content)
-                    probs = np.array([0.25, 0.25, 0.25, 0.25])
-                    gen_length = generated_ids.shape[0]
-                    input_length = int(input_lengths[b_idx])
-                    cot_text = content
-                    cot_pred = pred
-                    cot_input_len, cot_gen_len = input_length, gen_length
-
-                    if not printed_example:
-                        try:
-                            print("\n================ Example IO ({}) ================".format(subject))
-                            print("[Input with chat template]:\n" + str(texts[b_idx]))
-                            print("\n[Generated output]:\n" + str(cot_text))
-                            print("================ End Example IO ================\n")
-                        except Exception as e:
-                            print(f"Failed to print example IO for {subject}: {e}")
-                        finally:
-                            printed_example = True
-
-                    is_correct = (pred == true_answer) if pred else False
-                    cors.append(is_correct)
-                    all_probs.append(probs)
-
-                    if input_length is not None and gen_length is not None:
-                        length_ratio = gen_length / input_length if input_length > 0 else 0
-                        length_stats.append({
-                            'subject': subject,
-                            'question_id': i,
-                            'input_length': input_length,
-                            'gen_length': gen_length,
-                            'length_ratio': length_ratio,
-                            'is_correct': is_correct,
-                            'pred': pred,
-                            'true_answer': true_answer,
-                        })
-
-                    cot_log_entry = {
-                        'subject': subject,
-                        'question_id': i,
-                        'true_answer': true_answer,
-                        'pred': pred,
-                        'is_correct': is_correct,
-                        'answer_method': self.eval_config.get('answer_method', ''),
-                        'cot_pred': cot_pred,
-                        'cot_input_length': cot_input_len,
-                        'cot_gen_length': cot_gen_len,
-                        'cot_output': cot_text,
-                        'answer_latency_ms': latency_ms,
-                    }
-                    if self.dataset_name == "openbookqa":
-                        choices = example.get('choices', {}).get('text', [])
-                        cot_log_entry.update({
-                            'question': example.get('question_stem', ''),
-                            'A': choices[0] if len(choices) > 0 else '',
-                            'B': choices[1] if len(choices) > 1 else '',
-                            'C': choices[2] if len(choices) > 2 else '',
-                            'D': choices[3] if len(choices) > 3 else '',
-                        })
-                    elif self.dataset_name == "ai2-arc":
-                        choices = example.get('choices', {}).get('text', [])
-                        cot_log_entry.update({
-                            'question': example.get('question', ''),
-                            'A': choices[0] if len(choices) > 0 else '',
-                            'B': choices[1] if len(choices) > 1 else '',
-                            'C': choices[2] if len(choices) > 2 else '',
-                            'D': choices[3] if len(choices) > 3 else '',
-                        })
-                    elif self.dataset_name == "gpqa":
-                        prepared = self._prepare_gpqa_item(example)
-                        cot_log_entry.update({
-                            'question': prepared.get('question', ''),
-                            'A': prepared.get('choices', ['','','',''])[0],
-                            'B': prepared.get('choices', ['','','',''])[1],
-                            'C': prepared.get('choices', ['','','',''])[2],
-                            'D': prepared.get('choices', ['','','',''])[3],
-                        })
-                    elif self.dataset_name == "mmmlu":
-                        cot_log_entry.update({
-                            'question': example.get('Question', ''),
-                            'A': example.get('A', ''),
-                            'B': example.get('B', ''),
-                            'C': example.get('C', ''),
-                            'D': example.get('D', ''),
-                        })
-                    elif self.dataset_name == "mmlu-pro":
-                        options = example.get('options', [])
-                        cot_log_entry.update({
-                            'question': example.get('question', ''),
-                            'A': options[0] if len(options) > 0 else '',
-                            'B': options[1] if len(options) > 1 else '',
-                            'C': options[2] if len(options) > 2 else '',
-                            'D': options[3] if len(options) > 3 else '',
-                            'E': options[4] if len(options) > 4 else '',
-                            'F': options[5] if len(options) > 5 else '',
-                            'G': options[6] if len(options) > 6 else '',
-                            'H': options[7] if len(options) > 7 else '',
-                            'I': options[8] if len(options) > 8 else '',
-                            'J': options[9] if len(options) > 9 else '',
-                        })
-                    elif self.dataset_name == "ceval":
-                        cot_log_entry.update({
-                            'question': example.get('question', ''),
-                            'A': example.get('A', ''),
-                            'B': example.get('B', ''),
-                            'C': example.get('C', ''),
-                            'D': example.get('D', ''),
-                        })
-                    elif self.dataset_name == "mmlu-redux":
-                        choices = example.get('choices', [])
-                        cot_log_entry.update({
-                            'question': example.get('question', ''),
-                            'A': choices[0] if len(choices) > 0 else '',
-                            'B': choices[1] if len(choices) > 1 else '',
-                            'C': choices[2] if len(choices) > 2 else '',
-                            'D': choices[3] if len(choices) > 3 else '',
-                        })
-                    cot_logs.append(cot_log_entry)
-                    total_count += 1
-
-            if total_count > 0 and self.dataset_name != "longbench":
-                acc = np.mean(cors)
-                print(f"{subject} accuracy: {acc*100:.2f}% (evaluated on {total_count} samples, skipped {skip_count})")
-            else:
-                acc = 0
-                print(f"{subject} processed {total_count} samples, skipped {skip_count}")
-
-            return np.array(cors) if cors else None, acc, np.array(all_probs) if all_probs else None, length_stats, cot_logs
 
         if self.dataset_name == "longbench":
             # 检查学科名称是否以-e结尾
@@ -1331,6 +1079,27 @@ class UnifiedEvaluator:
                 output_file.unlink()
 
                
+        # Sampling configuration
+        sample_interval = self.eval_config.get("sample_interval", 1)
+        sample_indices = list(range(0, len(test_data), sample_interval))
+
+        # Apply virtual split window for datasets without native subjects
+        if is_virtual_split and total_splits > 1:
+            n = len(test_data)
+            start = (split_index * n) // total_splits
+            end = ((split_index + 1) * n) // total_splits
+            sample_indices = [i for i in sample_indices if start <= i < end]
+        limit = self.eval_config.get("limit", None)
+        if isinstance(limit, int) and limit > 0:
+            # Use first N indices
+            sample_indices = sample_indices[:limit]
+        elif isinstance(limit, (list, tuple)) and len(limit) == 2:
+            # Treat as [start, end) range on original indices
+            start, end = limit
+            start = 0 if start is None else int(start)
+            end = len(test_data) if end is None else int(end)
+            sample_indices = [i for i in sample_indices if start <= i < end]
+        
         for i in tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})"):
             try:
                 example = test_data[i]
@@ -1349,7 +1118,26 @@ class UnifiedEvaluator:
                         continue
 
                 # Format prompt (pass subject for locale-aware templates)
-                prompt = format_prompt(example)
+                if self.dataset_name == "mmmlu":
+                    prompt = self._format_mmmlu_example(example, use_cot=self.eval_config["use_cot"], subject=subject, use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "mmlu-redux":
+                    prompt = self._format_mmlu_redux_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "gpqa":
+                    prompt = self._format_gpqa_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name in ["math-500", "gsm8k"]:
+                    prompt = self._format_math_problem_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "openbookqa":
+                    prompt = self._format_openbookqa_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "ai2-arc":
+                    prompt = self._format_ai2_arc_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "mmlu-pro":
+                    prompt = self._format_mmlu_pro_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "ceval":
+                    prompt = self._format_ceval_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
+                elif self.dataset_name == "longbench":
+                    prompt = self._format_longbench_example(example, tokenizer) 
+                else:
+                    raise ValueError(f"Unknown dataset: {self.dataset_name}")
                 
                 # Generate answer
                 if model_type in ["two_stage", "two_stage_rosetta"]:

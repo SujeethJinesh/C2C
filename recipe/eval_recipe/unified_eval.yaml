@@ -37,7 +37,6 @@ eval:
   use_cot: false  # Enable chain-of-thought reasoning
   use_template: true
   sample_interval: 1  # Sample every N examples
-  batch_size: 1  # >1 enables batched generate for HF/Qwen (receiver-only)
   # limit:   # Limit examples per subject (null for all)
   # subjects: ["nutrition"] # Optional: specify specific subjects to evaluate
   # response_text: ""
