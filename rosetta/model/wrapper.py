@@ -55,7 +55,7 @@ class RosettaModel(nn.Module):
         base_model_idx = 0,
         projector_list: List[Projector] = [],
         include_response: bool = False,
-        multi_source_fusion_mode: str = "parallel",
+        multi_source_fusion_mode: str = "sequential",
         kv_quant_config: Optional[dict] = None,
         kv_transfer_config: Optional[dict] = None,
     ):
@@ -493,6 +493,8 @@ class RosettaModel(nn.Module):
         quantized_source_cache = {}
         transfer_cache = {}
         transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
+        transfer_mode = (self.kv_transfer_config.get("token_select_mode") or "").lower() if transfer_enabled else ""
+        transfer_cache_needs_target = transfer_mode == "proj_vnorm_topk"
         schedule = self.kv_quant_config.get("layer_schedule", {}) if self.kv_quant_config else {}
         schedule_active = bool(schedule.get("overrides"))
         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
@@ -507,6 +509,9 @@ class RosettaModel(nn.Module):
             source_kv_list = []
             for source_model_layer_idx, projector_idx in pair_list:
                 cache_key = (source_model_layer_idx, target_layer_idx) if schedule_active else source_model_layer_idx
+                transfer_cache_key = (
+                    (source_model_layer_idx, target_layer_idx) if transfer_cache_needs_target else cache_key
+                )
                 source_key_cache, source_value_cache = source_output_kv_cache[source_model_layer_idx]
                 new_source_key_cache = source_key_cache[:, :, -new_length:, :]
                 new_source_value_cache = source_value_cache[:, :, -new_length:, :]
@@ -519,7 +524,7 @@ class RosettaModel(nn.Module):
                         self.projector_list[projector_idx],
                         target_layer_idx,
                         transfer_cache,
-                        cache_key=cache_key,
+                        cache_key=transfer_cache_key,
                     )
                 else:
                     if cache_key in quantized_source_cache:
@@ -760,6 +765,8 @@ class RosettaModel(nn.Module):
                         quantized_source_cache = {}
                         transfer_cache = {}
                         transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
+                        transfer_mode = (self.kv_transfer_config.get("token_select_mode") or "").lower() if transfer_enabled else ""
+                        transfer_cache_needs_target = transfer_mode == "proj_vnorm_topk"
 
                         # For parallel mode, accumulate residuals for each target layer
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
@@ -790,6 +797,9 @@ class RosettaModel(nn.Module):
                                 source_kv_list = []
                                 for source_model_layer_idx, projector_idx in pair_list:
                                     cache_key = (source_model_layer_idx, target_layer_idx) if schedule_active else source_model_layer_idx
+                                    transfer_cache_key = (
+                                        (source_model_layer_idx, target_layer_idx) if transfer_cache_needs_target else cache_key
+                                    )
                                     source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
                                     new_source_key_cache = source_key_cache[:, :, start:end, :]
                                     new_source_value_cache = source_value_cache[:, :, start:end, :]
@@ -802,7 +812,7 @@ class RosettaModel(nn.Module):
                                             self.projector_list[projector_idx],
                                             target_layer_idx,
                                             transfer_cache,
-                                            cache_key=cache_key,
+                                            cache_key=transfer_cache_key,
                                         )
                                     else:
                                         if cache_key in quantized_source_cache:
