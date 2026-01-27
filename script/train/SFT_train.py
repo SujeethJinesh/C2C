@@ -393,6 +393,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
             include_response=model_config.get("include_response", False),
             multi_source_fusion_mode=model_config.get("multi_source_fusion_mode", "sequential"),
             kv_quant_config=model_config.get("kv_quant_config", None),
+            kv_transfer_config=model_config.get("kv_transfer_config", None),
         ).to(device).eval()
         
         

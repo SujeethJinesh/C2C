@@ -434,6 +434,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
     multi_source_fusion_mode = rosetta_config.get("multi_source_fusion_mode", "sequential")
     include_response = rosetta_config.get("include_response", False)
     kv_quant_config = rosetta_config.get("kv_quant_config")
+    kv_transfer_config = rosetta_config.get("kv_transfer_config")
     
     rosetta_model = RosettaModel(
         model_list=model_list,
@@ -442,6 +443,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
         include_response=include_response,
         multi_source_fusion_mode=multi_source_fusion_mode,
         kv_quant_config=kv_quant_config,
+        kv_transfer_config=kv_transfer_config,
     ).to(device).eval()
 
     # Load projector mapping configs from each LLM's checkpoint directory

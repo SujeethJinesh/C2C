@@ -123,6 +123,7 @@ def setup_models(model_config: Dict[str, Any], device: str = "cuda", dtype: torc
         base_model_idx=0,
         projector_list=[projector],
         kv_quant_config=model_config.get("kv_quant_config", None),
+        kv_transfer_config=model_config.get("kv_transfer_config", None),
     ).to(device)
     
     # Configure projector mappings

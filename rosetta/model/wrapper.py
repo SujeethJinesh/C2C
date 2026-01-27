@@ -12,6 +12,7 @@ import json
 
 from rosetta.model.projector import Projector
 from rosetta.utils.quant import maybe_quantize_kv_with_layer
+from rosetta.utils.kv_select import select_token_indices
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
 try:
@@ -56,6 +57,7 @@ class RosettaModel(nn.Module):
         include_response: bool = False,
         multi_source_fusion_mode: str = "parallel",
         kv_quant_config: Optional[dict] = None,
+        kv_transfer_config: Optional[dict] = None,
     ):
         super().__init__()
         # model list: a list of model, model 0 by default is the base model
@@ -83,6 +85,7 @@ class RosettaModel(nn.Module):
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
         self.multi_source_fusion_mode = multi_source_fusion_mode
         self.kv_quant_config = kv_quant_config or {"enabled": False}
+        self.kv_transfer_config = kv_transfer_config or {"enabled": False}
         if self.kv_quant_config.get("collect_stats", False):
             self._kv_quant_stats = {
                 "count": 0,
@@ -95,6 +98,16 @@ class RosettaModel(nn.Module):
             }
         else:
             self._kv_quant_stats = None
+        if self.kv_transfer_config.get("enabled", False):
+            self._kv_transfer_stats = {
+                "count": 0,
+                "selected_min": None,
+                "selected_max": None,
+                "selected_sum": 0,
+                "total_sum": 0,
+            }
+        else:
+            self._kv_transfer_stats = None
 
     @property
     def device(self):
@@ -184,6 +197,19 @@ class RosettaModel(nn.Module):
         else:
             self._kv_quant_stats = None
 
+    def set_kv_transfer_config(self, kv_transfer_config: Optional[dict]):
+        self.kv_transfer_config = kv_transfer_config or {"enabled": False}
+        if self.kv_transfer_config.get("enabled", False):
+            self._kv_transfer_stats = {
+                "count": 0,
+                "selected_min": None,
+                "selected_max": None,
+                "selected_sum": 0,
+                "total_sum": 0,
+            }
+        else:
+            self._kv_transfer_stats = None
+
     def get_kv_quant_stats(self):
         if self._kv_quant_stats is None:
             return None
@@ -192,6 +218,110 @@ class RosettaModel(nn.Module):
             stats["k_scale_mean"] = stats["k_scale_mean_sum"] / stats["count"]
             stats["v_scale_mean"] = stats["v_scale_mean_sum"] / stats["count"]
         return stats
+
+    def get_kv_transfer_stats(self):
+        if self._kv_transfer_stats is None:
+            return None
+        stats = dict(self._kv_transfer_stats)
+        if stats["count"] > 0:
+            stats["selected_mean"] = stats["selected_sum"] / stats["count"]
+            stats["total_mean"] = stats["total_sum"] / stats["count"]
+        return stats
+
+    def _update_kv_transfer_stats(self, selected_tokens: int, total_tokens: int):
+        if self._kv_transfer_stats is None:
+            return
+        stats = self._kv_transfer_stats
+        stats["count"] += 1
+        stats["selected_sum"] += int(selected_tokens)
+        stats["total_sum"] += int(total_tokens)
+        stats["selected_min"] = (
+            selected_tokens if stats["selected_min"] is None else min(stats["selected_min"], selected_tokens)
+        )
+        stats["selected_max"] = (
+            selected_tokens if stats["selected_max"] is None else max(stats["selected_max"], selected_tokens)
+        )
+
+    def _project_with_transfer(
+        self,
+        source_kv_cache,
+        base_kv_cache,
+        projector,
+        target_layer_idx: int,
+        transfer_cache: dict,
+        cache_key=None,
+    ):
+        """Apply optional token selection + quantization before projecting."""
+        transfer_cfg = self.kv_transfer_config or {}
+        transfer_enabled = bool(transfer_cfg.get("enabled", False))
+        sparse_fuse = bool(transfer_cfg.get("sparse_fuse", True))
+        scatter_fill = transfer_cfg.get("scatter_fill", "receiver_only")
+
+        key_cache, value_cache = source_kv_cache
+        base_key_cache, base_value_cache = base_kv_cache
+        seq_len = key_cache.shape[2]
+
+        idx = None
+        if transfer_enabled:
+            cache_key = cache_key or (id(source_kv_cache), target_layer_idx, seq_len)
+            if cache_key in transfer_cache:
+                idx, stats = transfer_cache[cache_key]
+            else:
+                idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg)
+                transfer_cache[cache_key] = (idx, stats)
+            self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"])
+
+            if idx.numel() == 0:
+                return (base_key_cache, base_value_cache), None
+
+        if transfer_enabled and sparse_fuse:
+            idx = idx.to(device=key_cache.device)
+            source_sel = (
+                key_cache[:, :, idx, :],
+                value_cache[:, :, idx, :],
+            )
+            base_sel = (
+                base_key_cache[:, :, idx, :],
+                base_value_cache[:, :, idx, :],
+            )
+            source_sel, q_info = maybe_quantize_kv_with_layer(
+                source_sel,
+                self.kv_quant_config,
+                target_layer_idx,
+            )
+            proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
+            proj_key_full = base_key_cache.clone()
+            proj_val_full = base_value_cache.clone()
+            proj_key_full[:, :, idx, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
+            proj_val_full[:, :, idx, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+            return (proj_key_full, proj_val_full), q_info
+
+        if transfer_enabled and not sparse_fuse:
+            mask = torch.zeros((1, 1, seq_len, 1), dtype=torch.bool, device=key_cache.device)
+            idx = idx.to(device=key_cache.device)
+            mask[:, :, idx, :] = True
+            mask = mask.expand_as(base_key_cache)
+            source_masked = (key_cache * mask, value_cache * mask)
+            source_masked, q_info = maybe_quantize_kv_with_layer(
+                source_masked,
+                self.kv_quant_config,
+                target_layer_idx,
+            )
+            proj_key_full, proj_val_full = projector.forward(source_masked, base_kv_cache)
+            if scatter_fill == "receiver_only":
+                proj_key_full = proj_key_full.clone()
+                proj_val_full = proj_val_full.clone()
+                proj_key_full[~mask] = base_key_cache[~mask]
+                proj_val_full[~mask] = base_value_cache[~mask]
+            return (proj_key_full, proj_val_full), q_info
+
+        source_kv_cache, q_info = maybe_quantize_kv_with_layer(
+            source_kv_cache,
+            self.kv_quant_config,
+            target_layer_idx,
+        )
+        proj_key, proj_val = projector.forward(source_kv_cache, base_kv_cache)
+        return (proj_key, proj_val), q_info
 
     @staticmethod
     def load_json(file_name):
@@ -349,6 +479,8 @@ class RosettaModel(nn.Module):
         fused_kv_cache = clone_kv_cache(base_output_kv_cache)
 
         quantized_source_cache = {}
+        transfer_cache = {}
+        transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
         schedule = self.kv_quant_config.get("layer_schedule", {}) if self.kv_quant_config else {}
         schedule_active = bool(schedule.get("overrides"))
         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
@@ -363,42 +495,55 @@ class RosettaModel(nn.Module):
             source_kv_list = []
             for source_model_layer_idx, projector_idx in pair_list:
                 cache_key = (source_model_layer_idx, target_layer_idx) if schedule_active else source_model_layer_idx
-                if cache_key in quantized_source_cache:
-                    new_source_kv_cache = quantized_source_cache[cache_key]
-                else:
-                    source_key_cache, source_value_cache = source_output_kv_cache[source_model_layer_idx]
-                    new_source_key_cache = source_key_cache[:, :, -new_length:, :]
-                    new_source_value_cache = source_value_cache[:, :, -new_length:, :]
-                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
-                    new_source_kv_cache, q_info = maybe_quantize_kv_with_layer(
+                source_key_cache, source_value_cache = source_output_kv_cache[source_model_layer_idx]
+                new_source_key_cache = source_key_cache[:, :, -new_length:, :]
+                new_source_value_cache = source_value_cache[:, :, -new_length:, :]
+                new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+
+                if transfer_enabled:
+                    (projected_key, projected_value), q_info = self._project_with_transfer(
                         new_source_kv_cache,
-                        self.kv_quant_config,
+                        new_base_kv_cache,
+                        self.projector_list[projector_idx],
                         target_layer_idx,
+                        transfer_cache,
+                        cache_key=cache_key,
                     )
-                    if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
-                        stats = self._kv_quant_stats
-                        stats["count"] += 1
-                        k_scale = q_info["k_scale"]
-                        v_scale = q_info["v_scale"]
-                        stats["k_scale_min"] = (
-                            k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                else:
+                    if cache_key in quantized_source_cache:
+                        new_source_kv_cache = quantized_source_cache[cache_key]
+                        q_info = None
+                    else:
+                        new_source_kv_cache, q_info = maybe_quantize_kv_with_layer(
+                            new_source_kv_cache,
+                            self.kv_quant_config,
+                            target_layer_idx,
                         )
-                        stats["k_scale_max"] = (
-                            k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
-                        )
-                        stats["k_scale_mean_sum"] += k_scale["mean"]
-                        stats["v_scale_min"] = (
-                            v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
-                        )
-                        stats["v_scale_max"] = (
-                            v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
-                        )
-                        stats["v_scale_mean_sum"] += v_scale["mean"]
-                    quantized_source_cache[cache_key] = new_source_kv_cache
-                projected_key, projected_value = self.projector_list[projector_idx].forward(
-                    new_source_kv_cache, # tuple of (key, value), each of shape (B, N, H, D)
-                    new_base_kv_cache
-                )
+                        quantized_source_cache[cache_key] = new_source_kv_cache
+                    projected_key, projected_value = self.projector_list[projector_idx].forward(
+                        new_source_kv_cache,
+                        new_base_kv_cache
+                    )
+
+                if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
+                    stats = self._kv_quant_stats
+                    stats["count"] += 1
+                    k_scale = q_info["k_scale"]
+                    v_scale = q_info["v_scale"]
+                    stats["k_scale_min"] = (
+                        k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                    )
+                    stats["k_scale_max"] = (
+                        k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
+                    )
+                    stats["k_scale_mean_sum"] += k_scale["mean"]
+                    stats["v_scale_min"] = (
+                        v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
+                    )
+                    stats["v_scale_max"] = (
+                        v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
+                    )
+                    stats["v_scale_mean_sum"] += v_scale["mean"]
                 projected_kv_list.append((projected_key, projected_value))
                 source_kv_list.append(new_source_kv_cache)
 
@@ -601,6 +746,8 @@ class RosettaModel(nn.Module):
                     if sharer_mask > 0:
                         base_cache = clone_kv_cache(curr_base_kv_cache)
                         quantized_source_cache = {}
+                        transfer_cache = {}
+                        transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
 
                         # For parallel mode, accumulate residuals for each target layer
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
@@ -631,42 +778,55 @@ class RosettaModel(nn.Module):
                                 source_kv_list = []
                                 for source_model_layer_idx, projector_idx in pair_list:
                                     cache_key = (source_model_layer_idx, target_layer_idx) if schedule_active else source_model_layer_idx
-                                    if cache_key in quantized_source_cache:
-                                        new_source_kv_cache = quantized_source_cache[cache_key]
-                                    else:
-                                        source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
-                                        new_source_key_cache = source_key_cache[:, :, start:end, :]
-                                        new_source_value_cache = source_value_cache[:, :, start:end, :]
-                                        new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
-                                        new_source_kv_cache, q_info = maybe_quantize_kv_with_layer(
+                                    source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
+                                    new_source_key_cache = source_key_cache[:, :, start:end, :]
+                                    new_source_value_cache = source_value_cache[:, :, start:end, :]
+                                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+
+                                    if transfer_enabled:
+                                        (projected_key, projected_value), q_info = self._project_with_transfer(
                                             new_source_kv_cache,
-                                            self.kv_quant_config,
+                                            new_base_kv_cache,
+                                            self.projector_list[projector_idx],
                                             target_layer_idx,
+                                            transfer_cache,
+                                            cache_key=cache_key,
                                         )
-                                        if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
-                                            stats = self._kv_quant_stats
-                                            stats["count"] += 1
-                                            k_scale = q_info["k_scale"]
-                                            v_scale = q_info["v_scale"]
-                                            stats["k_scale_min"] = (
-                                                k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                                    else:
+                                        if cache_key in quantized_source_cache:
+                                            new_source_kv_cache = quantized_source_cache[cache_key]
+                                            q_info = None
+                                        else:
+                                            new_source_kv_cache, q_info = maybe_quantize_kv_with_layer(
+                                                new_source_kv_cache,
+                                                self.kv_quant_config,
+                                                target_layer_idx,
                                             )
-                                            stats["k_scale_max"] = (
-                                                k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
-                                            )
-                                            stats["k_scale_mean_sum"] += k_scale["mean"]
-                                            stats["v_scale_min"] = (
-                                                v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
-                                            )
-                                            stats["v_scale_max"] = (
-                                                v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
-                                            )
-                                            stats["v_scale_mean_sum"] += v_scale["mean"]
-                                        quantized_source_cache[cache_key] = new_source_kv_cache
-                                    projected_key, projected_value = self.projector_list[projector_idx].forward(
-                                        new_source_kv_cache,
-                                        new_base_kv_cache
-                                    )
+                                            quantized_source_cache[cache_key] = new_source_kv_cache
+                                        projected_key, projected_value = self.projector_list[projector_idx].forward(
+                                            new_source_kv_cache,
+                                            new_base_kv_cache
+                                        )
+
+                                    if q_info and self._kv_quant_stats is not None and "k_scale" in q_info:
+                                        stats = self._kv_quant_stats
+                                        stats["count"] += 1
+                                        k_scale = q_info["k_scale"]
+                                        v_scale = q_info["v_scale"]
+                                        stats["k_scale_min"] = (
+                                            k_scale["min"] if stats["k_scale_min"] is None else min(stats["k_scale_min"], k_scale["min"])
+                                        )
+                                        stats["k_scale_max"] = (
+                                            k_scale["max"] if stats["k_scale_max"] is None else max(stats["k_scale_max"], k_scale["max"])
+                                        )
+                                        stats["k_scale_mean_sum"] += k_scale["mean"]
+                                        stats["v_scale_min"] = (
+                                            v_scale["min"] if stats["v_scale_min"] is None else min(stats["v_scale_min"], v_scale["min"])
+                                        )
+                                        stats["v_scale_max"] = (
+                                            v_scale["max"] if stats["v_scale_max"] is None else max(stats["v_scale_max"], v_scale["max"])
+                                        )
+                                        stats["v_scale_mean_sum"] += v_scale["mean"]
                                     projected_kv_list.append((projected_key, projected_value))
                                     source_kv_list.append(new_source_kv_cache)
 
