@@ -12,7 +12,7 @@ import json
 
 from rosetta.model.projector import Projector
 from rosetta.utils.quant import maybe_quantize_kv_with_layer
-from rosetta.utils.kv_select import select_token_indices
+from rosetta.utils.kv_select import select_token_indices, select_topk
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
 try:
@@ -267,7 +267,19 @@ class RosettaModel(nn.Module):
             if cache_key in transfer_cache:
                 idx, stats = transfer_cache[cache_key]
             else:
-                idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg)
+                mode = (transfer_cfg.get("token_select_mode") or "vnorm_topk").lower()
+                if mode == "proj_vnorm_topk":
+                    # Project full KV once to score in receiver space (projector-aware).
+                    proj_key_full, proj_val_full = projector.forward(source_kv_cache, base_kv_cache)
+                    scores = torch.linalg.norm(proj_val_full.float(), dim=-1).mean(dim=(0, 1))
+                    idx = select_topk(
+                        scores,
+                        proportion=float(transfer_cfg.get("token_select_proportion", 1.0)),
+                        min_tokens=int(transfer_cfg.get("token_select_min_tokens", 1)),
+                    )
+                    stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                else:
+                    idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg)
                 transfer_cache[cache_key] = (idx, stats)
             self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"])
 
