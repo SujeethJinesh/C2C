@@ -179,7 +179,7 @@ DATASET_CONFIGS = {
         "categories": {}
     },
     "openbookqa": {
-        "dataset_name": "openbookqa",
+        "dataset_name": "allenai/openbookqa",
         "test_split": "test",
         "subjects": ["main"],
         "subcategories": {},
