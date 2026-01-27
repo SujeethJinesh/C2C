@@ -1,0 +1,24 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: meta-llama/Llama-3.2-1B-Instruct
+    is_do_alignment: true
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/0.6+0.5B_C2C_general_again/final
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/0.6+0.5B_C2C_hetero
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  math_grading_method: "comprehensive"
