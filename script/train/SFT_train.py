@@ -101,6 +101,20 @@ def unfreeze_projectors(rosetta_model: RosettaModel):
             param.requires_grad = True
 
 
+def resolve_dtype(dtype_str: str) -> torch.dtype:
+    """Map config dtype strings to torch dtypes."""
+    if not dtype_str:
+        return torch.bfloat16
+    key = str(dtype_str).lower()
+    if key in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if key in ("fp16", "float16"):
+        return torch.float16
+    if key in ("fp32", "float32"):
+        return torch.float32
+    raise ValueError(f"Unsupported dtype '{dtype_str}'. Use bf16, fp16, or fp32.")
+
+
 def detect_training_mode(model_config: Dict[str, Any]) -> str:
     """Detect whether to use baseline or Rosetta training based on config"""
     if "baseline_model" in model_config and "base_model" not in model_config:
@@ -554,7 +568,10 @@ def main():
         print(f"Training mode: {training_mode}")
         print("Setting up models…")
     
-    model, main_tokenizer, aligner, llm_tokenizer = setup_models(model_config, training_mode, device, torch.bfloat16)
+    dtype = resolve_dtype(training_config.get("dtype", "bf16"))
+    if is_main_process:
+        print(f"Using dtype: {dtype}")
+    model, main_tokenizer, aligner, llm_tokenizer = setup_models(model_config, training_mode, device, dtype)
     model = model.to(device)
 
     # Apply freezing/training configuration based on mode

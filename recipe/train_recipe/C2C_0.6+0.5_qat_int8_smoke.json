@@ -30,6 +30,7 @@
         "weight_decay": 0.0,
         "num_epochs": 1,
         "max_length": 512,
+        "dtype": "fp16",
         "device": "mps",
         "scheduler_type": "linear",
         "warmup_ratio": 0.0,
