@@ -7,7 +7,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import json
 
 from rosetta.model.projector import Projector
-from rosetta.utils.quant import maybe_quantize_kv
+from rosetta.utils.quant import maybe_quantize_kv_with_layer
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
 try:
@@ -289,6 +289,8 @@ class OracleRosettaModel(nn.Module):
                     source_model_idx = kv_cache_index[i][0][0][0].item()  # Get the source model index from the kv_cache_index
                     if source_model_idx != -1:
                         quantized_source_cache = {}
+                        schedule = self.kv_quant_config.get("layer_schedule", {}) if self.kv_quant_config else {}
+                        schedule_active = bool(schedule.get("overrides"))
                         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
                             base_key_cache, base_value_cache = curr_base_kv_cache[target_layer_idx]
                             new_base_key_cache = base_key_cache[:, :, start:end, :]
@@ -300,15 +302,20 @@ class OracleRosettaModel(nn.Module):
                             projected_kv_list = []
                             source_kv_list = []
                             for source_model_layer_idx, projector_idx in pair_list:
-                                if source_model_layer_idx in quantized_source_cache:
-                                    new_source_kv_cache = quantized_source_cache[source_model_layer_idx]
+                                cache_key = (source_model_layer_idx, target_layer_idx) if schedule_active else source_model_layer_idx
+                                if cache_key in quantized_source_cache:
+                                    new_source_kv_cache = quantized_source_cache[cache_key]
                                 else:
                                     source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
                                     new_source_key_cache = source_key_cache[:, :, start:end, :]
                                     new_source_value_cache = source_value_cache[:, :, start:end, :]
                                     new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
-                                    new_source_kv_cache, _ = maybe_quantize_kv(new_source_kv_cache, self.kv_quant_config)
-                                    quantized_source_cache[source_model_layer_idx] = new_source_kv_cache
+                                    new_source_kv_cache, _ = maybe_quantize_kv_with_layer(
+                                        new_source_kv_cache,
+                                        self.kv_quant_config,
+                                        target_layer_idx,
+                                    )
+                                    quantized_source_cache[cache_key] = new_source_kv_cache
                                 projected_key, projected_value = self.projector_list[projector_idx].forward(
                                     new_source_kv_cache, # tuple of (key, value), each of shape (B, N, H, D)
                                     new_base_kv_cache

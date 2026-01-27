@@ -14,6 +14,17 @@ SUPPORTED_SCHEMES = {
     "int4": 4,
 }
 
+NO_QUANT_SCHEMES = {
+    "fp16",
+    "fp32",
+    "bf16",
+    "bfloat16",
+    "none",
+    "no",
+    "float16",
+    "float32",
+}
+
 
 def _get_qmax(num_bits: int) -> int:
     return (2 ** (num_bits - 1)) - 1
@@ -26,6 +37,42 @@ def _resolve_axis(axis: str) -> Tuple[int, ...]:
     if axis == "layer":
         return (0, 1, 2, 3)
     raise ValueError(f"Unsupported kv_quant_axis: {axis}")
+
+
+def _layer_in_override(layer_idx: int, override: Dict) -> bool:
+    if layer_idx is None:
+        return False
+    if "layers" in override and override["layers"] is not None:
+        return int(layer_idx) in [int(i) for i in override["layers"]]
+    if "range" in override and override["range"] is not None:
+        r = override["range"]
+        if isinstance(r, (list, tuple)) and len(r) == 2:
+            start, end = int(r[0]), int(r[1])
+            return start <= int(layer_idx) <= end
+    return False
+
+
+def _normalize_scheme(scheme) -> str:
+    if scheme is None:
+        return "int8"
+    if isinstance(scheme, str):
+        return scheme.lower()
+    return str(scheme).lower()
+
+
+def resolve_scheme(config: Optional[Dict], layer_idx: Optional[int] = None) -> str:
+    if not config:
+        return "int8"
+    base_scheme = _normalize_scheme(config.get("scheme", "int8"))
+    schedule = config.get("layer_schedule")
+    if not schedule or layer_idx is None:
+        return base_scheme
+    scheme = _normalize_scheme(schedule.get("default", base_scheme))
+    overrides = schedule.get("overrides", []) or []
+    for override in overrides:
+        if _layer_in_override(layer_idx, override):
+            scheme = _normalize_scheme(override.get("scheme", scheme))
+    return scheme
 
 
 def quantize_dequantize(
@@ -89,7 +136,7 @@ def maybe_quantize_kv(
     if not config or not config.get("enabled", False):
         return kv, None
 
-    scheme = config.get("scheme", "int8")
+    scheme = resolve_scheme(config, None)
     axis = config.get("axis", "head")
     eps = config.get("eps", 1e-6)
     collect_stats = config.get("collect_stats", False)
@@ -98,5 +145,37 @@ def maybe_quantize_kv(
     if key.numel() == 0 or value.numel() == 0:
         info = {"scheme": scheme, "axis": axis, "skipped": "empty"} if collect_stats else None
         return kv, info
+
+    if scheme in NO_QUANT_SCHEMES:
+        info = {"scheme": scheme, "axis": axis, "skipped": "no_quant"} if collect_stats else None
+        return kv, info
+
+    return quantize_kv(kv, scheme=scheme, axis=axis, eps=eps, collect_stats=collect_stats)
+
+
+def maybe_quantize_kv_with_layer(
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    config: Optional[Dict],
+    layer_idx: Optional[int],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+    if not config or not config.get("enabled", False):
+        return kv, None
+
+    scheme = resolve_scheme(config, layer_idx)
+    axis = config.get("axis", "head")
+    eps = config.get("eps", 1e-6)
+    collect_stats = config.get("collect_stats", False)
+
+    key, value = kv
+    if key.numel() == 0 or value.numel() == 0:
+        info = {"scheme": scheme, "axis": axis, "skipped": "empty"} if collect_stats else None
+        return kv, info
+
+    if scheme in NO_QUANT_SCHEMES:
+        info = {"scheme": scheme, "axis": axis, "skipped": "no_quant"} if collect_stats else None
+        return kv, info
+
+    if scheme not in SUPPORTED_SCHEMES:
+        raise ValueError(f"Unsupported kv_quant_scheme: {scheme}")
 
     return quantize_kv(kv, scheme=scheme, axis=axis, eps=eps, collect_stats=collect_stats)
