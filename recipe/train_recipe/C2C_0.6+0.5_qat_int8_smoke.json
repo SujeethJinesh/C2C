@@ -16,7 +16,7 @@
             "params": {
                 "hidden_dim": 512,
                 "intermediate_dim": 512,
-                "num_layers": 2,
+                "num_layers": 3,
                 "dropout": 0.0,
                 "initial_temperature": 1.0,
                 "final_temperature": 0.001,
@@ -29,9 +29,9 @@
         "learning_rate": 5e-5,
         "weight_decay": 0.0,
         "num_epochs": 1,
-        "max_length": 512,
-        "dtype": "fp16",
-        "device": "mps",
+        "max_length": 256,
+        "dtype": "fp32",
+        "device": "cpu",
         "scheduler_type": "linear",
         "warmup_ratio": 0.0,
         "max_grad_norm": 1.0,
@@ -55,10 +55,10 @@
     "data": {
         "type": "MMLUChatDataset",
         "kwargs": {
-            "split": "train",
-            "num_samples": 8,
+            "split": "dev",
+            "num_samples": 1,
             "max_word_count": 256
         },
-        "train_ratio": 0.99
+        "train_ratio": 1.0
     }
 }

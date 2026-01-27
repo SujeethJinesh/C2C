@@ -41,6 +41,20 @@ try:
 except ImportError:
     PEFT_AVAILABLE = False
 
+# RMSNorm shim for older torch versions on Mac
+if not hasattr(torch.nn, "RMSNorm"):
+    class RMSNorm(torch.nn.Module):
+        def __init__(self, hidden_size, eps=1e-6, dtype=None):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+            self.eps = eps
+
+        def forward(self, x):
+            norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+            return x * norm * self.weight
+
+    torch.nn.RMSNorm = RMSNorm
+
 torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed: int = 42):
