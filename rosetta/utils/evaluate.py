@@ -302,18 +302,23 @@ def load_hf_model(model_name: str, device: torch.device, generation_config: Opti
     # Check and set chat template
     set_default_chat_template(tokenizer, model_name)
 
+    dtype = torch.bfloat16
+    if device.type == "mps":
+        # MPS does not support bfloat16
+        dtype = torch.float16
+
     if model_name == "google/gemma-3-1b-it":
         torch._dynamo.config.cache_size_limit = 64
         model = AutoModelForCausalLM.from_pretrained(
             str(model_name),
-            torch_dtype=torch.bfloat16,
+            torch_dtype=dtype,
             device_map={"": device},
             sliding_window=4096
         ).eval()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             str(model_name),
-            torch_dtype=torch.bfloat16,
+            torch_dtype=dtype,
             device_map={"": device}
     ).eval()
     

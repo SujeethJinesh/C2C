@@ -1641,6 +1641,94 @@ class UnifiedEvaluator:
             "length_stats": all_length_stats,
             "cot_logs": cot_logs_all
         }
+
+    def evaluate_on_device(self, device: torch.device, subjects: List[str]) -> Dict[str, Any]:
+        """Evaluate on a single non-CUDA device (CPU/MPS)."""
+        if "two_stage_rosetta" == self.model_config["model_name"].lower():
+            model = TwoStageRosetta(
+                context_model_path=self.context_model_path,
+                rosetta_checkpoint_dir=self.rosetta_checkpoint_dir,
+                rosetta_subfolder=self.rosetta_subfolder,
+                device=device,
+                max_new_tokens=self.generation_config.get("max_new_tokens", self.eval_config.get("max_new_tokens", 1024)),
+                background_prompt=self.background_prompt,
+                generation_config=self.generation_config
+            )
+            tokenizer = model.rosetta_tokenizer
+            model_type = "two_stage_rosetta"
+            llm_tokenizer = model.llm_tokenizer
+            print(f"Initialized TwoStageRosetta pipeline on {device}")
+        elif "two_stage" == self.model_config["model_name"].lower():
+            model = TwoStageInference(
+                context_model_path=self.context_model_path,
+                answer_model_path=self.answer_model_path,
+                device=device,
+                max_new_tokens=self.generation_config.get("max_new_tokens", self.eval_config.get("max_new_tokens", 1024)),
+                background_prompt=self.background_prompt,
+                generation_config=self.generation_config
+            )
+            tokenizer = AutoTokenizer.from_pretrained(self.answer_model_path)
+            model_type = "two_stage"
+            llm_tokenizer = None
+            print(f"Initialized two-stage pipeline on {device}")
+        elif "rosetta" in self.model_config["model_name"].lower():
+            model, tokenizer = load_rosetta_model(self.model_config, self.eval_config, device=device, generation_config=self.generation_config)
+            rosetta_cfg = self.model_config.get("rosetta_config", {})
+            is_do_alignment = self.model_config.get("is_do_alignment", rosetta_cfg.get("is_do_alignment", False))
+            llm_model_path = rosetta_cfg.get("teacher_model")
+            llm_tokenizer = None
+            if is_do_alignment and llm_model_path:
+                try:
+                    llm_tokenizer = AutoTokenizer.from_pretrained(str(llm_model_path))
+                    if llm_tokenizer.pad_token is None:
+                        llm_tokenizer.pad_token = llm_tokenizer.eos_token
+                    set_default_chat_template(llm_tokenizer, llm_model_path)
+                except Exception as e:
+                    print(f"Failed to load LLM tokenizer '{llm_model_path}': {e}")
+                    llm_tokenizer = None
+            model_type = "rosetta"
+        else:
+            model, tokenizer = load_hf_model(self.model_config["model_name"], device=device, generation_config=self.generation_config)
+            if "Qwen" in self.model_config["model_name"]:
+                model_type = "qwen"
+            else:
+                model_type = "hf"
+            llm_tokenizer = None
+
+        all_cors = []
+        subject_cors = {}
+        subcat_cors = defaultdict(list)
+        cat_cors = defaultdict(list)
+        all_length_stats = []
+        cot_logs_all = []
+
+        for subject in subjects:
+            cors, acc, _, length_stats, cot_logs = self.evaluate_subject(
+                subject, model, tokenizer, device, model_type, llm_tokenizer
+            )
+            if cors is None and self.dataset_name != "longbench":
+                continue
+
+            all_cors.append(cors)
+            subject_cors[subject] = acc
+            all_length_stats.extend(length_stats)
+            cot_logs_all.extend(cot_logs)
+
+            if self.dataset_name == "mmlu-redux":
+                for subcat in self.dataset_config["subcategories"].get(subject, []):
+                    subcat_cors[subcat].append(cors)
+                    for cat, subcat_list in self.dataset_config["categories"].items():
+                        if subcat in subcat_list:
+                            cat_cors[cat].append(cors)
+
+        return {
+            "all_cors": all_cors,
+            "subject_cors": subject_cors,
+            "subcat_cors": dict(subcat_cors),
+            "cat_cors": dict(cat_cors),
+            "length_stats": all_length_stats,
+            "cot_logs": cot_logs_all
+        }
     
     def merge_results(self, results_by_rank: Dict) -> Tuple:
         """
@@ -1800,6 +1888,22 @@ class UnifiedEvaluator:
     
     def run(self):
         """Run the evaluation."""
+        device_override = self.eval_config.get("device")
+        if device_override and device_override != "cuda":
+            device = torch.device(device_override)
+            print(f"Using non-CUDA device: {device}")
+            subjects = self.dataset_config["subjects"]
+            if self.dataset_name in ["math-500", "gsm8k", "openbookqa", "gpqa", "ai2-arc", "mmlu-pro"]:
+                subjects = self._make_subject_splits(1)
+            if "subjects" in self.eval_config and self.eval_config["subjects"] is not None:
+                subjects = [s for s in subjects if s in self.eval_config["subjects"]]
+            if self.dataset_name == "longbench" and self.eval_config.get("longbench_e", False):
+                subjects = [f"{s}_e" for s in self.dataset_config["subjects_e"]]
+            results_by_rank = {0: self.evaluate_on_device(device, subjects)}
+            results = self.merge_results(results_by_rank)
+            self.save_results(*results)
+            return
+
         gpu_ids = self.eval_config["gpu_ids"]
         num_gpus = len(gpu_ids)
         print(f"Using {num_gpus} GPUs: {gpu_ids}")
