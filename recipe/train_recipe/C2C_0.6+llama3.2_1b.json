@@ -40,7 +40,7 @@
         "eval_steps": 100,
         "wandb_config": {
             "project": "Rosetta",
-            "mode": "online",
+            "mode": "disabled",
             "entity": "nics-efc",
             "run_name": "0.6B+Llama3.2_1B_C2C_OpenHermes_50k"
         }
