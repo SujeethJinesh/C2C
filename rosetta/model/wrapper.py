@@ -11,7 +11,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import json
 
 from rosetta.model.projector import Projector
-from rosetta.utils.quant import maybe_quantize_kv_with_layer
+from rosetta.utils.quant import maybe_quantize_kv_with_layer, quantize_kv
 from rosetta.utils.kv_select import select_token_indices, select_topk
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
@@ -44,6 +44,12 @@ def hybrid_to_dynamic(hybrid_cache):
         return DynamicCache.from_legacy_cache(legacy_cache)
 
     raise TypeError(f"Unsupported cache type: {type(hybrid_cache)}")
+
+def _stable_argsort_desc(scores: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.argsort(scores, descending=True, stable=True)
+    except TypeError:
+        return torch.argsort(scores, descending=True)
 
 class RosettaModel(nn.Module):
     """
@@ -250,18 +256,131 @@ class RosettaModel(nn.Module):
         target_layer_idx: int,
         transfer_cache: dict,
         cache_key=None,
+        scope_mask: Optional[torch.Tensor] = None,
     ):
         """Apply optional token selection + quantization before projecting."""
         transfer_cfg = self.kv_transfer_config or {}
         transfer_enabled = bool(transfer_cfg.get("enabled", False))
         sparse_fuse = bool(transfer_cfg.get("sparse_fuse", True))
         scatter_fill = transfer_cfg.get("scatter_fill", "receiver_only")
+        token_precision_mode = (transfer_cfg.get("token_precision_mode") or "").lower()
 
         key_cache, value_cache = source_kv_cache
         base_key_cache, base_value_cache = base_kv_cache
         seq_len = key_cache.shape[2]
 
+        if scope_mask is not None:
+            scope_mask = scope_mask.to(device=key_cache.device, dtype=torch.bool)
+
+        def _apply_scope(scores: torch.Tensor) -> torch.Tensor:
+            if scope_mask is None:
+                return scores
+            if scope_mask.shape[0] != scores.shape[0]:
+                raise ValueError("scope_mask length mismatch")
+            return scores.masked_fill(~scope_mask, float("-inf"))
+
+        def _bytes_per_token(bits_per_elem: float, index_bytes: float) -> float:
+            heads = int(key_cache.shape[1])
+            head_dim = int(key_cache.shape[3])
+            payload = 2 * heads * head_dim * (bits_per_elem / 8.0)
+            return payload + float(index_bytes)
+
+        def _scale_overhead_bytes(axis: str) -> float:
+            # Approximate: fp32 scale per head for K and V
+            heads = int(key_cache.shape[1])
+            if axis == "head":
+                return float(2 * heads * 4)
+            return float(2 * 4)
+
+        # RD-C2C path: token x precision allocation
+        if transfer_enabled and token_precision_mode == "rd_greedy":
+            axis = (self.kv_quant_config or {}).get("axis", "head")
+            eps = (self.kv_quant_config or {}).get("eps", 1e-6)
+            collect_stats = bool((self.kv_quant_config or {}).get("collect_stats", False))
+            candidates = [str(c).lower() for c in (transfer_cfg.get("token_precision_candidates") or ["drop", "int4", "int8"])]
+            budget_bytes = transfer_cfg.get("token_precision_budget_bytes")
+            budget_bytes = float(budget_bytes) if budget_bytes is not None else float("inf")
+            include_scale_overhead = bool(transfer_cfg.get("include_scale_overhead", False))
+            index_bytes = float(transfer_cfg.get("index_dtype_bytes") or 0.0)
+
+            # Use delta-projection scores (receiver-space marginal update)
+            source_for_score, q_info_score = maybe_quantize_kv_with_layer(
+                source_kv_cache,
+                self.kv_quant_config,
+                target_layer_idx,
+            )
+            proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
+            scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
+            scores = _apply_scope(scores)
+
+            order = _stable_argsort_desc(scores)
+            bytes_int8 = _bytes_per_token(8.0, index_bytes)
+            bytes_int4 = _bytes_per_token(4.0, index_bytes)
+            scale_overhead = _scale_overhead_bytes(axis) if include_scale_overhead else 0.0
+
+            idx_int8 = []
+            idx_int4 = []
+            remaining = float(budget_bytes)
+            used_int8 = False
+            used_int4 = False
+            for idx in order.tolist():
+                if not torch.isfinite(scores[idx]):
+                    break
+                if "int8" in candidates:
+                    cost = bytes_int8 + (scale_overhead if (include_scale_overhead and not used_int8) else 0.0)
+                    if remaining >= cost:
+                        idx_int8.append(idx)
+                        remaining -= cost
+                        used_int8 = True
+                        continue
+                if "int4" in candidates:
+                    cost = bytes_int4 + (scale_overhead if (include_scale_overhead and not used_int4) else 0.0)
+                    if remaining >= cost:
+                        idx_int4.append(idx)
+                        remaining -= cost
+                        used_int4 = True
+                        continue
+
+            selected_tokens = len(idx_int8) + len(idx_int4)
+            self._update_kv_transfer_stats(selected_tokens, int(seq_len))
+
+            proj_key_full = base_key_cache.clone()
+            proj_val_full = base_value_cache.clone()
+            q_info = {
+                "rd_groups": {
+                    "int8": int(len(idx_int8)),
+                    "int4": int(len(idx_int4)),
+                    "drop": int(seq_len - selected_tokens),
+                },
+                "rd_budget_bytes": float(budget_bytes),
+                "rd_bytes_used": float(budget_bytes - remaining),
+            }
+
+            if idx_int8:
+                idx_tensor = torch.tensor(idx_int8, device=key_cache.device, dtype=torch.long)
+                source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
+                base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                source_sel_q, q_info8 = quantize_kv(source_sel, scheme="int8", axis=axis, eps=eps, collect_stats=collect_stats)
+                proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
+                proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                q_info["int8"] = q_info8
+
+            if idx_int4:
+                idx_tensor = torch.tensor(idx_int4, device=key_cache.device, dtype=torch.long)
+                source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
+                base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                source_sel_q, q_info4 = quantize_kv(source_sel, scheme="int4", axis=axis, eps=eps, collect_stats=collect_stats)
+                proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
+                proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                q_info["int4"] = q_info4
+
+            return (proj_key_full, proj_val_full), q_info
+
         idx = None
+        proj_full_for_reuse = None
+        q_info_full = None
         if transfer_enabled:
             cache_key = cache_key or (id(source_kv_cache), target_layer_idx, seq_len)
             if cache_key in transfer_cache:
@@ -272,14 +391,32 @@ class RosettaModel(nn.Module):
                     # Project full KV once to score in receiver space (projector-aware).
                     proj_key_full, proj_val_full = projector.forward(source_kv_cache, base_kv_cache)
                     scores = torch.linalg.norm(proj_val_full.float(), dim=-1).mean(dim=(0, 1))
+                    scores = _apply_scope(scores)
                     idx = select_topk(
                         scores,
                         proportion=float(transfer_cfg.get("token_select_proportion", 1.0)),
                         min_tokens=int(transfer_cfg.get("token_select_min_tokens", 1)),
                     )
                     stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                elif mode == "delta_proj_vnorm_topk":
+                    # Use quantized projection for scoring to match transfer channel.
+                    source_for_score, q_info_full = maybe_quantize_kv_with_layer(
+                        source_kv_cache,
+                        self.kv_quant_config,
+                        target_layer_idx,
+                    )
+                    proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
+                    scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
+                    scores = _apply_scope(scores)
+                    idx = select_topk(
+                        scores,
+                        proportion=float(transfer_cfg.get("token_select_proportion", 1.0)),
+                        min_tokens=int(transfer_cfg.get("token_select_min_tokens", 1)),
+                    )
+                    stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                    proj_full_for_reuse = (proj_key_full, proj_val_full)
                 else:
-                    idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg)
+                    idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg, scope_mask=scope_mask)
                 transfer_cache[cache_key] = (idx, stats)
             self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"])
 
@@ -288,25 +425,33 @@ class RosettaModel(nn.Module):
 
         if transfer_enabled and sparse_fuse:
             idx = idx.to(device=key_cache.device)
-            source_sel = (
-                key_cache[:, :, idx, :],
-                value_cache[:, :, idx, :],
-            )
-            base_sel = (
-                base_key_cache[:, :, idx, :],
-                base_value_cache[:, :, idx, :],
-            )
-            source_sel, q_info = maybe_quantize_kv_with_layer(
-                source_sel,
-                self.kv_quant_config,
-                target_layer_idx,
-            )
-            proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
-            proj_key_full = base_key_cache.clone()
-            proj_val_full = base_value_cache.clone()
-            proj_key_full[:, :, idx, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
-            proj_val_full[:, :, idx, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
-            return (proj_key_full, proj_val_full), q_info
+            if proj_full_for_reuse is not None:
+                proj_key_full, proj_val_full = proj_full_for_reuse
+                proj_key_out = base_key_cache.clone()
+                proj_val_out = base_value_cache.clone()
+                proj_key_out[:, :, idx, :] = proj_key_full[:, :, idx, :].to(dtype=proj_key_out.dtype)
+                proj_val_out[:, :, idx, :] = proj_val_full[:, :, idx, :].to(dtype=proj_val_out.dtype)
+                return (proj_key_out, proj_val_out), q_info_full
+            else:
+                source_sel = (
+                    key_cache[:, :, idx, :],
+                    value_cache[:, :, idx, :],
+                )
+                base_sel = (
+                    base_key_cache[:, :, idx, :],
+                    base_value_cache[:, :, idx, :],
+                )
+                source_sel, q_info = maybe_quantize_kv_with_layer(
+                    source_sel,
+                    self.kv_quant_config,
+                    target_layer_idx,
+                )
+                proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
+                proj_key_full = base_key_cache.clone()
+                proj_val_full = base_value_cache.clone()
+                proj_key_full[:, :, idx, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
+                proj_val_full[:, :, idx, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                return (proj_key_full, proj_val_full), q_info
 
         if transfer_enabled and not sparse_fuse:
             mask = torch.zeros((1, 1, seq_len, 1), dtype=torch.bool, device=key_cache.device)
@@ -494,7 +639,8 @@ class RosettaModel(nn.Module):
         transfer_cache = {}
         transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
         transfer_mode = (self.kv_transfer_config.get("token_select_mode") or "").lower() if transfer_enabled else ""
-        transfer_cache_needs_target = transfer_mode == "proj_vnorm_topk"
+        token_precision_mode = (self.kv_transfer_config.get("token_precision_mode") or "").lower() if transfer_enabled else ""
+        transfer_cache_needs_target = transfer_mode in {"proj_vnorm_topk", "delta_proj_vnorm_topk"} or token_precision_mode == "rd_greedy"
         schedule = self.kv_quant_config.get("layer_schedule", {}) if self.kv_quant_config else {}
         schedule_active = bool(schedule.get("overrides"))
         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
@@ -516,7 +662,6 @@ class RosettaModel(nn.Module):
                 new_source_key_cache = source_key_cache[:, :, -new_length:, :]
                 new_source_value_cache = source_value_cache[:, :, -new_length:, :]
                 new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
-
                 if transfer_enabled:
                     (projected_key, projected_value), q_info = self._project_with_transfer(
                         new_source_kv_cache,
@@ -525,6 +670,7 @@ class RosettaModel(nn.Module):
                         target_layer_idx,
                         transfer_cache,
                         cache_key=transfer_cache_key,
+                        scope_mask=None,
                     )
                 else:
                     if cache_key in quantized_source_cache:
@@ -766,7 +912,17 @@ class RosettaModel(nn.Module):
                         transfer_cache = {}
                         transfer_enabled = bool(self.kv_transfer_config.get("enabled", False)) if self.kv_transfer_config else False
                         transfer_mode = (self.kv_transfer_config.get("token_select_mode") or "").lower() if transfer_enabled else ""
-                        transfer_cache_needs_target = transfer_mode == "proj_vnorm_topk"
+                        token_precision_mode = (self.kv_transfer_config.get("token_precision_mode") or "").lower() if transfer_enabled else ""
+                        transfer_cache_needs_target = transfer_mode in {"proj_vnorm_topk", "delta_proj_vnorm_topk"} or token_precision_mode == "rd_greedy"
+
+                        scope_mask = None
+                        if transfer_enabled:
+                            scope_key = "token_precision_scope" if token_precision_mode == "rd_greedy" else "token_select_scope"
+                            scope_value = (self.kv_transfer_config.get(scope_key) or "all_context").lower()
+                            if scope_value not in {"all_context", "all", "context", "full"}:
+                                section_index = kv_cache_index[i] if kv_cache_index is not None else None
+                                if section_index is not None and section_index.numel() > 0:
+                                    scope_mask = section_index[0, :, 0] > 0
 
                         # For parallel mode, accumulate residuals for each target layer
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
@@ -813,6 +969,7 @@ class RosettaModel(nn.Module):
                                             target_layer_idx,
                                             transfer_cache,
                                             cache_key=transfer_cache_key,
+                                            scope_mask=scope_mask,
                                         )
                                     else:
                                         if cache_key in quantized_source_cache:
