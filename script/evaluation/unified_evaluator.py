@@ -300,6 +300,80 @@ class UnifiedEvaluator:
         print(f"Requested GPU IDs: {self.eval_config['gpu_ids']}")
         print(f"Answer method: {self.eval_config['answer_method']}")
 
+    def _extract_kv_stats(self, model):
+        target = model
+        if hasattr(model, "rosetta_model"):
+            target = getattr(model, "rosetta_model", None)
+        kv_quant_stats = None
+        kv_transfer_stats = None
+        if target is not None and hasattr(target, "get_kv_quant_stats"):
+            try:
+                kv_quant_stats = target.get_kv_quant_stats()
+            except Exception:
+                kv_quant_stats = None
+        if target is not None and hasattr(target, "get_kv_transfer_stats"):
+            try:
+                kv_transfer_stats = target.get_kv_transfer_stats()
+            except Exception:
+                kv_transfer_stats = None
+        return kv_quant_stats, kv_transfer_stats
+
+    def _merge_stat_dict(self, base: Optional[Dict[str, Any]], new: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if new is None:
+            return base
+        if base is None:
+            base = {}
+        for key, value in new.items():
+            if value is None:
+                continue
+            if key == "count" or key.endswith("_count") or key.endswith("_sum") or key.endswith("_sum_ms"):
+                base[key] = base.get(key, 0) + value
+            elif key.endswith("_min"):
+                base[key] = value if base.get(key) is None else min(base[key], value)
+            elif key.endswith("_max"):
+                base[key] = value if base.get(key) is None else max(base[key], value)
+        return base
+
+    def _finalize_kv_quant_stats(self, stats: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not stats:
+            return None
+        out = dict(stats)
+        count = out.get("count", 0)
+        if count and out.get("k_scale_mean_sum") is not None:
+            out["k_scale_mean"] = out["k_scale_mean_sum"] / count
+        if count and out.get("v_scale_mean_sum") is not None:
+            out["v_scale_mean"] = out["v_scale_mean_sum"] / count
+        return out
+
+    def _finalize_kv_transfer_stats(self, stats: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not stats:
+            return None
+        out = dict(stats)
+        count = out.get("count", 0)
+        if count:
+            out["selected_mean"] = out.get("selected_sum", 0) / count
+            out["total_mean"] = out.get("total_sum", 0) / count
+            if "selected_fraction_sum" in out:
+                out["selected_fraction_mean"] = out.get("selected_fraction_sum", 0.0) / count
+            if "score_mean_sum" in out:
+                out["score_mean"] = out.get("score_mean_sum", 0.0) / count
+            if out.get("prefill_count", 0):
+                out["prefill_time_mean_ms"] = out.get("prefill_time_sum_ms", 0.0) / out.get("prefill_count", 1)
+            out["selection_time_mean_ms"] = out.get("selection_time_sum_ms", 0.0) / count
+            out["projection_score_time_mean_ms"] = out.get("projection_score_time_sum_ms", 0.0) / count
+            out["projection_transfer_time_mean_ms"] = out.get("projection_transfer_time_sum_ms", 0.0) / count
+            out["fuse_time_mean_ms"] = out.get("fuse_time_sum_ms", 0.0) / count
+            out["rd_int8_mean"] = out.get("rd_int8_sum", 0.0) / count
+            out["rd_int4_mean"] = out.get("rd_int4_sum", 0.0) / count
+            out["rd_drop_mean"] = out.get("rd_drop_sum", 0.0) / count
+            out["rd_budget_bytes_mean"] = out.get("rd_budget_bytes_sum", 0.0) / count
+            out["rd_bytes_used_mean"] = out.get("rd_bytes_used_sum", 0.0) / count
+            out["rd_effective_bits_mean"] = out.get("rd_effective_bits_sum", 0.0) / count
+            out["rd_payload_bytes_mean"] = out.get("rd_payload_bytes_sum", 0.0) / count
+            out["rd_index_bytes_mean"] = out.get("rd_index_bytes_sum", 0.0) / count
+            out["rd_scale_bytes_mean"] = out.get("rd_scale_bytes_sum", 0.0) / count
+        return out
+
     def _make_subject_splits(self, num_gpus: int) -> List[str]:
         """Create virtual subject splits for datasets without native subjects.
 
@@ -1632,14 +1706,17 @@ class UnifiedEvaluator:
                     for cat, subcat_list in self.dataset_config["categories"].items():
                         if subcat in subcat_list:
                             cat_cors[cat].append(cors)
-        
+
+        kv_quant_stats, kv_transfer_stats = self._extract_kv_stats(model)
         return_dict[rank] = {
             "all_cors": all_cors,
             "subject_cors": subject_cors,
             "subcat_cors": dict(subcat_cors),
             "cat_cors": dict(cat_cors),
             "length_stats": all_length_stats,
-            "cot_logs": cot_logs_all
+            "cot_logs": cot_logs_all,
+            "kv_quant_stats": kv_quant_stats,
+            "kv_transfer_stats": kv_transfer_stats,
         }
 
     def evaluate_on_device(self, device: torch.device, subjects: List[str]) -> Dict[str, Any]:
@@ -1721,13 +1798,16 @@ class UnifiedEvaluator:
                         if subcat in subcat_list:
                             cat_cors[cat].append(cors)
 
+        kv_quant_stats, kv_transfer_stats = self._extract_kv_stats(model)
         return {
             "all_cors": all_cors,
             "subject_cors": subject_cors,
             "subcat_cors": dict(subcat_cors),
             "cat_cors": dict(cat_cors),
             "length_stats": all_length_stats,
-            "cot_logs": cot_logs_all
+            "cot_logs": cot_logs_all,
+            "kv_quant_stats": kv_quant_stats,
+            "kv_transfer_stats": kv_transfer_stats,
         }
     
     def merge_results(self, results_by_rank: Dict) -> Tuple:
@@ -1746,6 +1826,8 @@ class UnifiedEvaluator:
         cat_cors = defaultdict(list)
         all_length_stats = []
         all_cot_logs = []
+        kv_quant_stats = None
+        kv_transfer_stats = None
         
         for result in results_by_rank.values():
             all_cors.extend(result["all_cors"])
@@ -1757,11 +1839,16 @@ class UnifiedEvaluator:
                 subcat_cors[k].extend(v)
             for k, v in result.get("cat_cors", {}).items():
                 cat_cors[k].extend(v)
-        
-        return all_cors, subject_cors, subcat_cors, cat_cors, all_length_stats, all_cot_logs
+            kv_quant_stats = self._merge_stat_dict(kv_quant_stats, result.get("kv_quant_stats"))
+            kv_transfer_stats = self._merge_stat_dict(kv_transfer_stats, result.get("kv_transfer_stats"))
+
+        kv_quant_stats = self._finalize_kv_quant_stats(kv_quant_stats)
+        kv_transfer_stats = self._finalize_kv_transfer_stats(kv_transfer_stats)
+
+        return all_cors, subject_cors, subcat_cors, cat_cors, all_length_stats, all_cot_logs, kv_quant_stats, kv_transfer_stats
     
-    def save_results(self, all_cors, subject_cors, subcat_cors, cat_cors, 
-                    all_length_stats, all_cot_logs):
+    def save_results(self, all_cors, subject_cors, subcat_cors, cat_cors,
+                    all_length_stats, all_cot_logs, kv_quant_stats, kv_transfer_stats):
         """
         Save evaluation results.
         
@@ -1782,6 +1869,10 @@ class UnifiedEvaluator:
             "overall_accuracy": overall_accuracy,
             "subjects": subject_cors
         }
+        if kv_quant_stats is not None:
+            summary["kv_quant_stats"] = kv_quant_stats
+        if kv_transfer_stats is not None:
+            summary["kv_transfer_stats"] = kv_transfer_stats
         
         # Add categories and subcategories for MMLU-Redux
         if self.dataset_name == "mmlu-redux":

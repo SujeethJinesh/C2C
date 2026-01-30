@@ -91,8 +91,25 @@ def select_token_indices(
     min_tokens = int(config.get("token_select_min_tokens", 1))
     scores = compute_token_scores(k, v, mode=mode, scope_mask=scope_mask)
     idx = select_topk(scores, proportion=proportion, min_tokens=min_tokens)
+    score_mean = None
+    score_min = None
+    score_max = None
+    if idx.numel() > 0:
+        sel_scores = scores[idx]
+        finite_mask = torch.isfinite(sel_scores)
+        if finite_mask.any():
+            finite_scores = sel_scores[finite_mask]
+            score_mean = float(finite_scores.mean().item())
+            score_min = float(finite_scores.min().item())
+            score_max = float(finite_scores.max().item())
     stats = {
         "selected_tokens": int(idx.numel()),
         "total_tokens": int(k.shape[2]),
     }
+    if score_mean is not None:
+        stats["score_mean"] = score_mean
+        stats["score_min"] = score_min
+        stats["score_max"] = score_max
+    if stats["total_tokens"] > 0:
+        stats["selected_fraction"] = float(stats["selected_tokens"] / stats["total_tokens"])
     return idx, stats

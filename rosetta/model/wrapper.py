@@ -3,6 +3,8 @@ The ensemble of multiple standard transformers LLM models, with automatic kv-cac
 """
 
 from typing import List, Optional, Union
+import math
+import time
 import torch
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
@@ -111,6 +113,25 @@ class RosettaModel(nn.Module):
                 "selected_max": None,
                 "selected_sum": 0,
                 "total_sum": 0,
+                "selected_fraction_sum": 0.0,
+                "score_mean_sum": 0.0,
+                "score_min": None,
+                "score_max": None,
+                "prefill_count": 0,
+                "prefill_time_sum_ms": 0.0,
+                "selection_time_sum_ms": 0.0,
+                "projection_score_time_sum_ms": 0.0,
+                "projection_transfer_time_sum_ms": 0.0,
+                "fuse_time_sum_ms": 0.0,
+                "rd_int8_sum": 0,
+                "rd_int4_sum": 0,
+                "rd_drop_sum": 0,
+                "rd_budget_bytes_sum": 0.0,
+                "rd_bytes_used_sum": 0.0,
+                "rd_effective_bits_sum": 0.0,
+                "rd_payload_bytes_sum": 0.0,
+                "rd_index_bytes_sum": 0.0,
+                "rd_scale_bytes_sum": 0.0,
             }
         else:
             self._kv_transfer_stats = None
@@ -212,6 +233,25 @@ class RosettaModel(nn.Module):
                 "selected_max": None,
                 "selected_sum": 0,
                 "total_sum": 0,
+                "selected_fraction_sum": 0.0,
+                "score_mean_sum": 0.0,
+                "score_min": None,
+                "score_max": None,
+                "prefill_count": 0,
+                "prefill_time_sum_ms": 0.0,
+                "selection_time_sum_ms": 0.0,
+                "projection_score_time_sum_ms": 0.0,
+                "projection_transfer_time_sum_ms": 0.0,
+                "fuse_time_sum_ms": 0.0,
+                "rd_int8_sum": 0,
+                "rd_int4_sum": 0,
+                "rd_drop_sum": 0,
+                "rd_budget_bytes_sum": 0.0,
+                "rd_bytes_used_sum": 0.0,
+                "rd_effective_bits_sum": 0.0,
+                "rd_payload_bytes_sum": 0.0,
+                "rd_index_bytes_sum": 0.0,
+                "rd_scale_bytes_sum": 0.0,
             }
         else:
             self._kv_transfer_stats = None
@@ -229,12 +269,34 @@ class RosettaModel(nn.Module):
         if self._kv_transfer_stats is None:
             return None
         stats = dict(self._kv_transfer_stats)
-        if stats["count"] > 0:
+        count = stats.get("count", 0)
+        if count > 0:
             stats["selected_mean"] = stats["selected_sum"] / stats["count"]
             stats["total_mean"] = stats["total_sum"] / stats["count"]
+            if "selected_fraction_sum" in stats:
+                stats["selected_fraction_mean"] = stats["selected_fraction_sum"] / count
+            elif stats.get("total_sum", 0) > 0:
+                stats["selected_fraction_mean"] = stats["selected_sum"] / stats["total_sum"]
+            if "score_mean_sum" in stats:
+                stats["score_mean"] = stats["score_mean_sum"] / stats["count"]
+            if stats.get("prefill_count", 0) > 0:
+                stats["prefill_time_mean_ms"] = stats.get("prefill_time_sum_ms", 0.0) / stats["prefill_count"]
+            stats["selection_time_mean_ms"] = stats.get("selection_time_sum_ms", 0.0) / count
+            stats["projection_score_time_mean_ms"] = stats.get("projection_score_time_sum_ms", 0.0) / count
+            stats["projection_transfer_time_mean_ms"] = stats.get("projection_transfer_time_sum_ms", 0.0) / count
+            stats["fuse_time_mean_ms"] = stats.get("fuse_time_sum_ms", 0.0) / count
+            stats["rd_int8_mean"] = stats.get("rd_int8_sum", 0.0) / count
+            stats["rd_int4_mean"] = stats.get("rd_int4_sum", 0.0) / count
+            stats["rd_drop_mean"] = stats.get("rd_drop_sum", 0.0) / count
+            stats["rd_budget_bytes_mean"] = stats.get("rd_budget_bytes_sum", 0.0) / count
+            stats["rd_bytes_used_mean"] = stats.get("rd_bytes_used_sum", 0.0) / count
+            stats["rd_effective_bits_mean"] = stats.get("rd_effective_bits_sum", 0.0) / count
+            stats["rd_payload_bytes_mean"] = stats.get("rd_payload_bytes_sum", 0.0) / count
+            stats["rd_index_bytes_mean"] = stats.get("rd_index_bytes_sum", 0.0) / count
+            stats["rd_scale_bytes_mean"] = stats.get("rd_scale_bytes_sum", 0.0) / count
         return stats
 
-    def _update_kv_transfer_stats(self, selected_tokens: int, total_tokens: int):
+    def _update_kv_transfer_stats(self, selected_tokens: int, total_tokens: int, extra: Optional[dict] = None):
         if self._kv_transfer_stats is None:
             return
         stats = self._kv_transfer_stats
@@ -247,6 +309,23 @@ class RosettaModel(nn.Module):
         stats["selected_max"] = (
             selected_tokens if stats["selected_max"] is None else max(stats["selected_max"], selected_tokens)
         )
+        if extra:
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                if key.endswith("_min"):
+                    stats[key] = value if stats.get(key) is None else min(stats[key], value)
+                elif key.endswith("_max"):
+                    stats[key] = value if stats.get(key) is None else max(stats[key], value)
+                else:
+                    stats[key] = stats.get(key, 0) + value
+
+    def _update_prefill_stats(self, prefill_time_ms: float):
+        if self._kv_transfer_stats is None:
+            return
+        stats = self._kv_transfer_stats
+        stats["prefill_count"] = stats.get("prefill_count", 0) + 1
+        stats["prefill_time_sum_ms"] = stats.get("prefill_time_sum_ms", 0.0) + float(prefill_time_ms)
 
     def _project_with_transfer(
         self,
@@ -279,6 +358,12 @@ class RosettaModel(nn.Module):
                 raise ValueError("scope_mask length mismatch")
             return scores.masked_fill(~scope_mask, float("-inf"))
 
+        timing_sync = bool(transfer_cfg.get("timing_sync", False))
+
+        def _sync():
+            if timing_sync and key_cache.is_cuda:
+                torch.cuda.synchronize(key_cache.device)
+
         def _bytes_per_token(bits_per_elem: float, index_bytes: float) -> float:
             heads = int(key_cache.shape[1])
             head_dim = int(key_cache.shape[3])
@@ -292,6 +377,25 @@ class RosettaModel(nn.Module):
                 return float(2 * heads * 4)
             return float(2 * 4)
 
+        def _score_stats(scores: torch.Tensor, idx_tensor: torch.Tensor) -> dict:
+            if idx_tensor is None or idx_tensor.numel() == 0:
+                return {}
+            sel_scores = scores[idx_tensor]
+            finite_mask = torch.isfinite(sel_scores)
+            if not finite_mask.any():
+                return {}
+            finite_scores = sel_scores[finite_mask]
+            return {
+                "score_mean": float(finite_scores.mean().item()),
+                "score_min": float(finite_scores.min().item()),
+                "score_max": float(finite_scores.max().item()),
+            }
+
+        projection_score_time_ms = 0.0
+        selection_time_ms = 0.0
+        projection_transfer_time_ms = 0.0
+        fuse_time_ms = 0.0
+
         # RD-C2C path: token x precision allocation
         if transfer_enabled and token_precision_mode == "rd_greedy":
             axis = (self.kv_quant_config or {}).get("axis", "head")
@@ -304,16 +408,26 @@ class RosettaModel(nn.Module):
             index_bytes = float(transfer_cfg.get("index_dtype_bytes") or 0.0)
 
             # Use delta-projection scores (receiver-space marginal update)
-            source_for_score, q_info_score = maybe_quantize_kv_with_layer(
+            _sync()
+            t_score = time.perf_counter()
+            source_for_score, _ = maybe_quantize_kv_with_layer(
                 source_kv_cache,
                 self.kv_quant_config,
                 target_layer_idx,
             )
             proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
+            _sync()
+            projection_score_time_ms = (time.perf_counter() - t_score) * 1000.0
+
+            _sync()
+            t_select = time.perf_counter()
             scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
             scores = _apply_scope(scores)
 
             order = _stable_argsort_desc(scores)
+            _sync()
+            selection_time_ms = (time.perf_counter() - t_select) * 1000.0
+
             bytes_int8 = _bytes_per_token(8.0, index_bytes)
             bytes_int4 = _bytes_per_token(4.0, index_bytes)
             scale_overhead = _scale_overhead_bytes(axis) if include_scale_overhead else 0.0
@@ -342,10 +456,22 @@ class RosettaModel(nn.Module):
                         continue
 
             selected_tokens = len(idx_int8) + len(idx_int4)
-            self._update_kv_transfer_stats(selected_tokens, int(seq_len))
+            selected_fraction = (selected_tokens / float(seq_len)) if seq_len > 0 else 0.0
+            idx_all = idx_int8 + idx_int4
+            idx_tensor_all = (
+                torch.tensor(idx_all, device=key_cache.device, dtype=torch.long)
+                if idx_all
+                else torch.empty((0,), device=key_cache.device, dtype=torch.long)
+            )
+            score_stats = _score_stats(scores, idx_tensor_all)
 
+            _sync()
+            t_fuse = time.perf_counter()
             proj_key_full = base_key_cache.clone()
             proj_val_full = base_value_cache.clone()
+            _sync()
+            fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+
             q_info = {
                 "rd_groups": {
                     "int8": int(len(idx_int8)),
@@ -353,28 +479,90 @@ class RosettaModel(nn.Module):
                     "drop": int(seq_len - selected_tokens),
                 },
                 "rd_budget_bytes": float(budget_bytes),
-                "rd_bytes_used": float(budget_bytes - remaining),
             }
 
             if idx_int8:
                 idx_tensor = torch.tensor(idx_int8, device=key_cache.device, dtype=torch.long)
                 source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
                 base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                _sync()
+                t_proj = time.perf_counter()
                 source_sel_q, q_info8 = quantize_kv(source_sel, scheme="int8", axis=axis, eps=eps, collect_stats=collect_stats)
                 proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                _sync()
+                projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                _sync()
+                t_fuse = time.perf_counter()
                 proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
                 proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                _sync()
+                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 q_info["int8"] = q_info8
 
             if idx_int4:
                 idx_tensor = torch.tensor(idx_int4, device=key_cache.device, dtype=torch.long)
                 source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
                 base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                _sync()
+                t_proj = time.perf_counter()
                 source_sel_q, q_info4 = quantize_kv(source_sel, scheme="int4", axis=axis, eps=eps, collect_stats=collect_stats)
                 proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                _sync()
+                projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                _sync()
+                t_fuse = time.perf_counter()
                 proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
                 proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                _sync()
+                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 q_info["int4"] = q_info4
+
+            heads = int(key_cache.shape[1])
+            head_dim = int(key_cache.shape[3])
+            payload_bytes_int8 = float(2 * heads * head_dim)
+            payload_bytes_int4 = float(heads * head_dim)
+            payload_bytes = payload_bytes_int8 * len(idx_int8) + payload_bytes_int4 * len(idx_int4)
+            index_bytes_total = float(len(idx_int8) + len(idx_int4)) * float(index_bytes)
+            scale_bytes_total = 0.0
+            if include_scale_overhead:
+                if used_int8:
+                    scale_bytes_total += scale_overhead
+                if used_int4:
+                    scale_bytes_total += scale_overhead
+            bytes_used = payload_bytes + index_bytes_total + scale_bytes_total
+            if math.isfinite(budget_bytes):
+                q_info["rd_bytes_used"] = float(budget_bytes - remaining)
+            else:
+                q_info["rd_bytes_used"] = float(bytes_used)
+            effective_bits = None
+            if selected_tokens > 0:
+                elems_per_token = float(2 * heads * head_dim)
+                effective_bits = float((bytes_used * 8.0) / (elems_per_token * selected_tokens))
+
+            extra_stats = {
+                "selected_fraction_sum": selected_fraction,
+                "selection_time_sum_ms": selection_time_ms,
+                "projection_score_time_sum_ms": projection_score_time_ms,
+                "projection_transfer_time_sum_ms": projection_transfer_time_ms,
+                "fuse_time_sum_ms": fuse_time_ms,
+                "rd_int8_sum": int(len(idx_int8)),
+                "rd_int4_sum": int(len(idx_int4)),
+                "rd_drop_sum": int(seq_len - selected_tokens),
+                "rd_budget_bytes_sum": float(budget_bytes) if math.isfinite(budget_bytes) else 0.0,
+                "rd_bytes_used_sum": float(bytes_used),
+                "rd_effective_bits_sum": float(effective_bits) if effective_bits is not None else 0.0,
+                "rd_payload_bytes_sum": float(payload_bytes),
+                "rd_index_bytes_sum": float(index_bytes_total),
+                "rd_scale_bytes_sum": float(scale_bytes_total),
+            }
+            if score_stats:
+                extra_stats["score_mean_sum"] = score_stats.get("score_mean", 0.0)
+                if score_stats.get("score_min") is not None:
+                    extra_stats["score_min"] = score_stats.get("score_min")
+                if score_stats.get("score_max") is not None:
+                    extra_stats["score_max"] = score_stats.get("score_max")
+
+            self._update_kv_transfer_stats(selected_tokens, int(seq_len), extra=extra_stats)
 
             return (proj_key_full, proj_val_full), q_info
 
@@ -389,7 +577,13 @@ class RosettaModel(nn.Module):
                 mode = (transfer_cfg.get("token_select_mode") or "vnorm_topk").lower()
                 if mode == "proj_vnorm_topk":
                     # Project full KV once to score in receiver space (projector-aware).
+                    _sync()
+                    t_score = time.perf_counter()
                     proj_key_full, proj_val_full = projector.forward(source_kv_cache, base_kv_cache)
+                    _sync()
+                    projection_score_time_ms = (time.perf_counter() - t_score) * 1000.0
+                    _sync()
+                    t_select = time.perf_counter()
                     scores = torch.linalg.norm(proj_val_full.float(), dim=-1).mean(dim=(0, 1))
                     scores = _apply_scope(scores)
                     idx = select_topk(
@@ -397,15 +591,26 @@ class RosettaModel(nn.Module):
                         proportion=float(transfer_cfg.get("token_select_proportion", 1.0)),
                         min_tokens=int(transfer_cfg.get("token_select_min_tokens", 1)),
                     )
+                    _sync()
+                    selection_time_ms = (time.perf_counter() - t_select) * 1000.0
+                    score_stats = _score_stats(scores, idx)
                     stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                    if score_stats:
+                        stats.update(score_stats)
                 elif mode == "delta_proj_vnorm_topk":
                     # Use quantized projection for scoring to match transfer channel.
+                    _sync()
+                    t_score = time.perf_counter()
                     source_for_score, q_info_full = maybe_quantize_kv_with_layer(
                         source_kv_cache,
                         self.kv_quant_config,
                         target_layer_idx,
                     )
                     proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
+                    _sync()
+                    projection_score_time_ms = (time.perf_counter() - t_score) * 1000.0
+                    _sync()
+                    t_select = time.perf_counter()
                     scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
                     scores = _apply_scope(scores)
                     idx = select_topk(
@@ -413,24 +618,55 @@ class RosettaModel(nn.Module):
                         proportion=float(transfer_cfg.get("token_select_proportion", 1.0)),
                         min_tokens=int(transfer_cfg.get("token_select_min_tokens", 1)),
                     )
+                    _sync()
+                    selection_time_ms = (time.perf_counter() - t_select) * 1000.0
+                    score_stats = _score_stats(scores, idx)
                     stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                    if score_stats:
+                        stats.update(score_stats)
                     proj_full_for_reuse = (proj_key_full, proj_val_full)
                 else:
+                    _sync()
+                    t_select = time.perf_counter()
                     idx, stats = select_token_indices(key_cache, value_cache, transfer_cfg, scope_mask=scope_mask)
+                    _sync()
+                    selection_time_ms = (time.perf_counter() - t_select) * 1000.0
+                if stats.get("total_tokens"):
+                    stats.setdefault("selected_fraction", float(stats["selected_tokens"] / stats["total_tokens"]))
                 transfer_cache[cache_key] = (idx, stats)
-            self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"])
+            selected_fraction = stats.get("selected_fraction")
+            if selected_fraction is None and stats.get("total_tokens"):
+                selected_fraction = float(stats["selected_tokens"] / stats["total_tokens"])
+            extra_stats = {
+                "selected_fraction_sum": float(selected_fraction or 0.0),
+                "selection_time_sum_ms": selection_time_ms,
+                "projection_score_time_sum_ms": projection_score_time_ms,
+            }
+            if stats.get("score_mean") is not None:
+                extra_stats["score_mean_sum"] = float(stats.get("score_mean"))
+            if stats.get("score_min") is not None:
+                extra_stats["score_min"] = float(stats.get("score_min"))
+            if stats.get("score_max") is not None:
+                extra_stats["score_max"] = float(stats.get("score_max"))
 
             if idx.numel() == 0:
+                self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (base_key_cache, base_value_cache), None
 
         if transfer_enabled and sparse_fuse:
             idx = idx.to(device=key_cache.device)
             if proj_full_for_reuse is not None:
                 proj_key_full, proj_val_full = proj_full_for_reuse
+                _sync()
+                t_fuse = time.perf_counter()
                 proj_key_out = base_key_cache.clone()
                 proj_val_out = base_value_cache.clone()
                 proj_key_out[:, :, idx, :] = proj_key_full[:, :, idx, :].to(dtype=proj_key_out.dtype)
                 proj_val_out[:, :, idx, :] = proj_val_full[:, :, idx, :].to(dtype=proj_val_out.dtype)
+                _sync()
+                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+                extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+                self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (proj_key_out, proj_val_out), q_info_full
             else:
                 source_sel = (
@@ -441,16 +677,27 @@ class RosettaModel(nn.Module):
                     base_key_cache[:, :, idx, :],
                     base_value_cache[:, :, idx, :],
                 )
+                _sync()
+                t_proj = time.perf_counter()
                 source_sel, q_info = maybe_quantize_kv_with_layer(
                     source_sel,
                     self.kv_quant_config,
                     target_layer_idx,
                 )
                 proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
+                _sync()
+                projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                _sync()
+                t_fuse = time.perf_counter()
                 proj_key_full = base_key_cache.clone()
                 proj_val_full = base_value_cache.clone()
                 proj_key_full[:, :, idx, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
                 proj_val_full[:, :, idx, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
+                _sync()
+                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+                extra_stats["projection_transfer_time_sum_ms"] = projection_transfer_time_ms
+                extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+                self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (proj_key_full, proj_val_full), q_info
 
         if transfer_enabled and not sparse_fuse:
@@ -459,17 +706,28 @@ class RosettaModel(nn.Module):
             mask[:, :, idx, :] = True
             mask = mask.expand_as(base_key_cache)
             source_masked = (key_cache * mask, value_cache * mask)
+            _sync()
+            t_proj = time.perf_counter()
             source_masked, q_info = maybe_quantize_kv_with_layer(
                 source_masked,
                 self.kv_quant_config,
                 target_layer_idx,
             )
             proj_key_full, proj_val_full = projector.forward(source_masked, base_kv_cache)
+            _sync()
+            projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
             if scatter_fill == "receiver_only":
+                _sync()
+                t_fuse = time.perf_counter()
                 proj_key_full = proj_key_full.clone()
                 proj_val_full = proj_val_full.clone()
                 proj_key_full[~mask] = base_key_cache[~mask]
                 proj_val_full[~mask] = base_value_cache[~mask]
+                _sync()
+                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+            extra_stats["projection_transfer_time_sum_ms"] = projection_transfer_time_ms
+            extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+            self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
             return (proj_key_full, proj_val_full), q_info
 
         source_kv_cache, q_info = maybe_quantize_kv_with_layer(
@@ -1121,16 +1379,36 @@ class RosettaModel(nn.Module):
         batch_size = base_input_ids.size(0)
 
         # Prefill to build caches and obtain initial logits
-        prefill_output = self.forward(
-            kv_cache_index=kv_cache_index,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            *args,
-            **kwargs,
-        )
+        transfer_enabled = bool((self.kv_transfer_config or {}).get("enabled", False))
+        if transfer_enabled:
+            timing_sync = bool((self.kv_transfer_config or {}).get("timing_sync", False))
+            if timing_sync and base_input_ids.is_cuda:
+                torch.cuda.synchronize(base_input_ids.device)
+            t_prefill = time.perf_counter()
+            prefill_output = self.forward(
+                kv_cache_index=kv_cache_index,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                *args,
+                **kwargs,
+            )
+            if timing_sync and base_input_ids.is_cuda:
+                torch.cuda.synchronize(base_input_ids.device)
+            self._update_prefill_stats((time.perf_counter() - t_prefill) * 1000.0)
+        else:
+            prefill_output = self.forward(
+                kv_cache_index=kv_cache_index,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                *args,
+                **kwargs,
+            )
 
         current_past = prefill_output.past_key_values
         all_input_ids = base_input_ids
