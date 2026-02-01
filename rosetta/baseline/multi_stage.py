@@ -477,7 +477,7 @@ class TwoStageRosetta(TwoStageInference):
         llm_model_path = config["model"].get("teacher_model")
         self.llm_tokenizer = None
         
-        if is_do_alignment and llm_model_path:
+        if llm_model_path:
             try:
                 self.llm_tokenizer = AutoTokenizer.from_pretrained(str(llm_model_path))
                 if self.llm_tokenizer.pad_token is None:
@@ -486,6 +486,24 @@ class TwoStageRosetta(TwoStageInference):
             except Exception as e:
                 print(f"Failed to load LLM tokenizer '{llm_model_path}': {e}")
                 self.llm_tokenizer = None
+
+        base_tokenizer = self.rosetta_tokenizer
+        if base_tokenizer is None:
+            try:
+                base_model_path = config["model"]["base_model"]
+                base_tokenizer = AutoTokenizer.from_pretrained(str(base_model_path))
+            except Exception as e:
+                print(f"Failed to load base tokenizer '{base_model_path}': {e}")
+                base_tokenizer = None
+
+        if (not is_do_alignment) and self.llm_tokenizer is not None and base_tokenizer is not None:
+            base_name = getattr(base_tokenizer, "name_or_path", None)
+            llm_name = getattr(self.llm_tokenizer, "name_or_path", None)
+            if base_tokenizer.vocab_size != self.llm_tokenizer.vocab_size or base_name != llm_name:
+                raise ValueError("Alignment disabled but tokenizers differ; enable alignment for hetero pairs.")
+
+        if not is_do_alignment:
+            self.llm_tokenizer = None
         
         print(f"Initialized TwoStageRosetta with Rosetta model on {self.device}")
     
