@@ -749,6 +749,8 @@ class RosettaModel(nn.Module):
                 if cached_int4:
                     idx_tensor = cached_int4[1]
                     idx_int4 = idx_tensor.tolist() if idx_tensor is not None else []
+                used_int8 = bool(idx_int8)
+                used_int4 = bool(idx_int4)
             else:
                 for idx in order.tolist():
                     if not torch.isfinite(scores[idx]):
