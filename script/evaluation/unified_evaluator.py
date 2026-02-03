@@ -1263,6 +1263,10 @@ class UnifiedEvaluator:
         for i in tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})"):
             try:
                 example = test_data[i]
+                if hasattr(model, "set_wire_cache_key"):
+                    model.set_wire_cache_key(f"{self.dataset_name}_{subject}_{i}")
+                elif hasattr(model, "kv_transfer_config") and isinstance(getattr(model, "kv_transfer_config"), dict):
+                    model.kv_transfer_config["wire_cache_key"] = f"{self.dataset_name}_{subject}_{i}"
                 
                 if self.dataset_name != "longbench":
                     true_answer = self.parse_answer(example)

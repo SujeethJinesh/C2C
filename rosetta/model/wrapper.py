@@ -4,6 +4,7 @@ The ensemble of multiple standard transformers LLM models, with automatic kv-cac
 
 from typing import List, Optional, Union
 import math
+import os
 import time
 import torch
 from torch import nn
@@ -392,6 +393,11 @@ class RosettaModel(nn.Module):
         stats["prefill_count"] = stats.get("prefill_count", 0) + 1
         stats["prefill_time_sum_ms"] = stats.get("prefill_time_sum_ms", 0.0) + float(prefill_time_ms)
 
+    def set_wire_cache_key(self, key: Optional[str]):
+        if self.kv_transfer_config is None:
+            return
+        self.kv_transfer_config["wire_cache_key"] = key
+
     def _start_transfer_sample(self):
         if self._kv_transfer_stats is None:
             return
@@ -462,8 +468,12 @@ class RosettaModel(nn.Module):
         scatter_fill = transfer_cfg.get("scatter_fill", "receiver_only")
         token_precision_mode = (transfer_cfg.get("token_precision_mode") or "").lower()
 
-        key_cache, value_cache = source_kv_cache
         base_key_cache, base_value_cache = base_kv_cache
+        if source_kv_cache is None:
+            key_cache = base_key_cache
+            value_cache = base_value_cache
+        else:
+            key_cache, value_cache = source_kv_cache
         seq_len = key_cache.shape[2]
 
         if scope_mask is not None:
@@ -503,6 +513,11 @@ class RosettaModel(nn.Module):
         wire_scale_dtype = (transfer_cfg.get("wire_scale_dtype") or "fp16").lower()
         wire_include_headers = bool(transfer_cfg.get("wire_include_headers", True))
         wire_index_bytes = float(transfer_cfg.get("wire_index_dtype_bytes") or transfer_cfg.get("index_dtype_bytes") or 0.0)
+        wire_cache_dir = transfer_cfg.get("wire_cache_dir")
+        wire_cache_mode = (transfer_cfg.get("wire_cache_mode") or "off").lower()
+        wire_cache_key = transfer_cfg.get("wire_cache_key")
+        wire_cache_tag = transfer_cfg.get("wire_cache_tag") or ""
+        wire_cache_suffix = transfer_cfg.get("wire_cache_suffix") or ""
 
         def _wire_payload_bytes(token_count: int, quant_mode: str) -> float:
             if token_count <= 0:
@@ -553,7 +568,54 @@ class RosettaModel(nn.Module):
             payload = json.dumps(meta, separators=(",", ":")).encode("utf-8")
             return float(12 + len(payload))
 
-        def _maybe_apply_wire_pack(source_sel, indices, quant_mode: str, apply_decoded: bool = True):
+        def _wire_cache_path(group: str, quant_mode: str) -> Optional[str]:
+            if not wire_cache_dir or not wire_cache_key:
+                return None
+            tag = wire_cache_tag
+            key = wire_cache_key
+            suffix = wire_cache_suffix
+            name_parts = [p for p in [tag, key, suffix] if p]
+            base = "_".join(name_parts) if name_parts else "wire"
+            group_tag = group or "all"
+            fname = f"{base}_layer{int(target_layer_idx)}_{group_tag}_{quant_mode}.kvw"
+            return os.path.join(wire_cache_dir, fname)
+
+        def _load_wire_blob(path: Optional[str]):
+            if not path or not wire_enabled or kvwire_unpack is None:
+                return None
+            if not os.path.exists(path):
+                return None
+            try:
+                blob = None
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+                if not blob:
+                    return None
+                t_decode = time.perf_counter()
+                decoded = kvwire_unpack(blob, KVWireConfig())
+                decode_ms = (time.perf_counter() - t_decode) * 1000.0
+                k_dec = torch.from_numpy(decoded["k"]).to(device=base_key_cache.device, dtype=base_key_cache.dtype)
+                v_dec = torch.from_numpy(decoded["v"]).to(device=base_value_cache.device, dtype=base_value_cache.dtype)
+                idx_np = decoded.get("indices")
+                idx = torch.from_numpy(idx_np).to(device=base_key_cache.device, dtype=torch.long) if idx_np is not None else None
+                meta = decoded.get("meta") or {}
+                sections = meta.get("sections") or {}
+                payload_bytes = int(sections.get("k_quant", 0)) + int(sections.get("v_quant", 0))
+                index_bytes = int(sections.get("indices", 0))
+                scale_bytes = int(sections.get("scales", 0))
+                header_bytes = int(len(blob) - payload_bytes - index_bytes - scale_bytes)
+                breakdown = {
+                    "payload_bytes": float(payload_bytes),
+                    "index_bytes": float(index_bytes),
+                    "scale_bytes": float(scale_bytes),
+                    "header_bytes": float(header_bytes),
+                    "total_bytes": float(len(blob)),
+                }
+                return (k_dec, v_dec), idx, decode_ms, breakdown
+            except Exception:
+                return None
+
+        def _maybe_apply_wire_pack(source_sel, indices, quant_mode: str, apply_decoded: bool = True, cache_path: Optional[str] = None):
             if not wire_enabled:
                 return source_sel, 0.0, 0.0, None
             if not wire_apply_pack:
@@ -576,6 +638,10 @@ class RosettaModel(nn.Module):
                 t_encode = time.perf_counter()
                 blob, breakdown = kvwire_pack_with_breakdown({"k": k_np, "v": v_np, "indices": idx_np}, cfg)
                 encode_ms = (time.perf_counter() - t_encode) * 1000.0
+                if cache_path:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, "wb") as handle:
+                        handle.write(blob)
                 t_decode = time.perf_counter()
                 decoded = kvwire_unpack(blob, cfg)
                 decode_ms = (time.perf_counter() - t_decode) * 1000.0
@@ -627,27 +693,45 @@ class RosettaModel(nn.Module):
             budget_bytes = float(budget_bytes) if budget_bytes is not None else float("inf")
             include_scale_overhead = bool(transfer_cfg.get("include_scale_overhead", False))
             index_bytes = float(transfer_cfg.get("index_dtype_bytes") or 0.0)
+            use_cached_rd = False
+            cached_int8 = None
+            cached_int4 = None
+            if wire_cache_mode == "read" and wire_cache_dir and wire_cache_key:
+                if "int8" in candidates:
+                    cached_int8 = _load_wire_blob(_wire_cache_path("int8", "int8"))
+                if "int4" in candidates:
+                    cached_int4 = _load_wire_blob(_wire_cache_path("int4", "int4"))
+                if cached_int8 or cached_int4:
+                    use_cached_rd = True
+                elif source_kv_cache is None:
+                    raise RuntimeError("wire_cache_mode=read but no cached RD blobs found")
+            if source_kv_cache is None and not use_cached_rd:
+                raise RuntimeError("source_kv_cache missing for RD transfer")
 
             # Use delta-projection scores (receiver-space marginal update)
-            _sync()
-            t_score = time.perf_counter()
-            source_for_score, _ = maybe_quantize_kv_with_layer(
-                source_kv_cache,
-                self.kv_quant_config,
-                target_layer_idx,
-            )
-            proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
-            _sync()
-            projection_score_time_ms = (time.perf_counter() - t_score) * 1000.0
+            if use_cached_rd:
+                scores = None
+                order = None
+            else:
+                _sync()
+                t_score = time.perf_counter()
+                source_for_score, _ = maybe_quantize_kv_with_layer(
+                    source_kv_cache,
+                    self.kv_quant_config,
+                    target_layer_idx,
+                )
+                proj_key_full, proj_val_full = projector.forward(source_for_score, base_kv_cache)
+                _sync()
+                projection_score_time_ms = (time.perf_counter() - t_score) * 1000.0
 
-            _sync()
-            t_select = time.perf_counter()
-            scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
-            scores = _apply_scope(scores)
+                _sync()
+                t_select = time.perf_counter()
+                scores = torch.linalg.norm((proj_val_full - base_value_cache).float(), dim=-1).mean(dim=(0, 1))
+                scores = _apply_scope(scores)
 
-            order = _stable_argsort_desc(scores)
-            _sync()
-            selection_time_ms = (time.perf_counter() - t_select) * 1000.0
+                order = _stable_argsort_desc(scores)
+                _sync()
+                selection_time_ms = (time.perf_counter() - t_select) * 1000.0
 
             bytes_int8 = _bytes_per_token(8.0, index_bytes)
             bytes_int4 = _bytes_per_token(4.0, index_bytes)
@@ -658,23 +742,31 @@ class RosettaModel(nn.Module):
             remaining = float(budget_bytes)
             used_int8 = False
             used_int4 = False
-            for idx in order.tolist():
-                if not torch.isfinite(scores[idx]):
-                    break
-                if "int8" in candidates:
-                    cost = bytes_int8 + (scale_overhead if (include_scale_overhead and not used_int8) else 0.0)
-                    if remaining >= cost:
-                        idx_int8.append(idx)
-                        remaining -= cost
-                        used_int8 = True
-                        continue
-                if "int4" in candidates:
-                    cost = bytes_int4 + (scale_overhead if (include_scale_overhead and not used_int4) else 0.0)
-                    if remaining >= cost:
-                        idx_int4.append(idx)
-                        remaining -= cost
-                        used_int4 = True
-                        continue
+            if use_cached_rd:
+                if cached_int8:
+                    idx_tensor = cached_int8[1]
+                    idx_int8 = idx_tensor.tolist() if idx_tensor is not None else []
+                if cached_int4:
+                    idx_tensor = cached_int4[1]
+                    idx_int4 = idx_tensor.tolist() if idx_tensor is not None else []
+            else:
+                for idx in order.tolist():
+                    if not torch.isfinite(scores[idx]):
+                        break
+                    if "int8" in candidates:
+                        cost = bytes_int8 + (scale_overhead if (include_scale_overhead and not used_int8) else 0.0)
+                        if remaining >= cost:
+                            idx_int8.append(idx)
+                            remaining -= cost
+                            used_int8 = True
+                            continue
+                    if "int4" in candidates:
+                        cost = bytes_int4 + (scale_overhead if (include_scale_overhead and not used_int4) else 0.0)
+                        if remaining >= cost:
+                            idx_int4.append(idx)
+                            remaining -= cost
+                            used_int4 = True
+                            continue
 
             selected_tokens = len(idx_int8) + len(idx_int4)
             selected_fraction = (selected_tokens / float(seq_len)) if seq_len > 0 else 0.0
@@ -684,7 +776,7 @@ class RosettaModel(nn.Module):
                 if idx_all
                 else torch.empty((0,), device=key_cache.device, dtype=torch.long)
             )
-            score_stats = _score_stats(scores, idx_tensor_all)
+            score_stats = _score_stats(scores, idx_tensor_all) if scores is not None else {}
 
             _sync()
             t_fuse = time.perf_counter()
@@ -711,59 +803,101 @@ class RosettaModel(nn.Module):
             wire_used_breakdown = False
 
             if idx_int8:
-                idx_tensor = torch.tensor(idx_int8, device=key_cache.device, dtype=torch.long)
-                source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
-                base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                if use_cached_rd and cached_int8:
+                    source_sel_q, idx_tensor, dec_ms, breakdown = cached_int8
+                    base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                    _sync()
+                    t_proj = time.perf_counter()
+                    proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                    _sync()
+                    projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                    q_info8 = {"scheme": "int8", "cached": True}
+                    wire_decode_ms += dec_ms
+                    if breakdown:
+                        wire_used_breakdown = True
+                        wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                        wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                        wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                        wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                        wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
+                else:
+                    idx_tensor = torch.tensor(idx_int8, device=key_cache.device, dtype=torch.long)
+                    source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
+                    base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                    _sync()
+                    t_proj = time.perf_counter()
+                    source_sel_q, q_info8 = quantize_kv(source_sel, scheme="int8", axis=axis, eps=eps, collect_stats=collect_stats)
+                    cache_path = _wire_cache_path("int8", "int8") if wire_cache_mode == "write" else None
+                    source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int8", cache_path=cache_path)
+                    wire_encode_ms += enc_ms
+                    wire_decode_ms += dec_ms
+                    if breakdown:
+                        wire_used_breakdown = True
+                        wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                        wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                        wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                        wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                        wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
+                    proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
                 _sync()
-                t_proj = time.perf_counter()
-                source_sel_q, q_info8 = quantize_kv(source_sel, scheme="int8", axis=axis, eps=eps, collect_stats=collect_stats)
-                source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int8")
-                wire_encode_ms += enc_ms
-                wire_decode_ms += dec_ms
-                if breakdown:
-                    wire_used_breakdown = True
-                    wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
-                    wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
-                    wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
-                    wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
-                    wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
-                proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
-                _sync()
-                projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
-                _sync()
-                t_fuse = time.perf_counter()
+                if not (use_cached_rd and cached_int8):
+                    projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                    _sync()
+                    t_fuse = time.perf_counter()
                 proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
                 proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
-                _sync()
-                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+                if not (use_cached_rd and cached_int8):
+                    _sync()
+                    fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 q_info["int8"] = q_info8
 
             if idx_int4:
-                idx_tensor = torch.tensor(idx_int4, device=key_cache.device, dtype=torch.long)
-                source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
-                base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                if use_cached_rd and cached_int4:
+                    source_sel_q, idx_tensor, dec_ms, breakdown = cached_int4
+                    base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                    _sync()
+                    t_proj = time.perf_counter()
+                    proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
+                    _sync()
+                    projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                    q_info4 = {"scheme": "int4", "cached": True}
+                    wire_decode_ms += dec_ms
+                    if breakdown:
+                        wire_used_breakdown = True
+                        wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                        wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                        wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                        wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                        wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
+                else:
+                    idx_tensor = torch.tensor(idx_int4, device=key_cache.device, dtype=torch.long)
+                    source_sel = (key_cache[:, :, idx_tensor, :], value_cache[:, :, idx_tensor, :])
+                    base_sel = (base_key_cache[:, :, idx_tensor, :], base_value_cache[:, :, idx_tensor, :])
+                    _sync()
+                    t_proj = time.perf_counter()
+                    source_sel_q, q_info4 = quantize_kv(source_sel, scheme="int4", axis=axis, eps=eps, collect_stats=collect_stats)
+                    cache_path = _wire_cache_path("int4", "int4") if wire_cache_mode == "write" else None
+                    source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int4", cache_path=cache_path)
+                    wire_encode_ms += enc_ms
+                    wire_decode_ms += dec_ms
+                    if breakdown:
+                        wire_used_breakdown = True
+                        wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                        wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                        wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                        wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                        wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
+                    proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
                 _sync()
-                t_proj = time.perf_counter()
-                source_sel_q, q_info4 = quantize_kv(source_sel, scheme="int4", axis=axis, eps=eps, collect_stats=collect_stats)
-                source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int4")
-                wire_encode_ms += enc_ms
-                wire_decode_ms += dec_ms
-                if breakdown:
-                    wire_used_breakdown = True
-                    wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
-                    wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
-                    wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
-                    wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
-                    wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
-                proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
-                _sync()
-                projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
-                _sync()
-                t_fuse = time.perf_counter()
+                if not (use_cached_rd and cached_int4):
+                    projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
+                    _sync()
+                    t_fuse = time.perf_counter()
                 proj_key_full[:, :, idx_tensor, :] = proj_key_sel.to(dtype=proj_key_full.dtype)
                 proj_val_full[:, :, idx_tensor, :] = proj_val_sel.to(dtype=proj_val_full.dtype)
-                _sync()
-                fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
+                if not (use_cached_rd and cached_int4):
+                    _sync()
+                    fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 q_info["int4"] = q_info4
 
             heads = int(key_cache.shape[1])
@@ -844,13 +978,37 @@ class RosettaModel(nn.Module):
         idx = None
         proj_full_for_reuse = None
         q_info_full = None
+        cached_non_rd = None
+        cached_non_rd_decode_ms = 0.0
+        cached_non_rd_breakdown = None
         if transfer_enabled:
             cache_key = cache_key or (id(source_kv_cache), target_layer_idx, seq_len)
             if cache_key in transfer_cache:
                 idx, stats = transfer_cache[cache_key]
             else:
                 mode = (transfer_cfg.get("token_select_mode") or "vnorm_topk").lower()
-                if mode == "proj_vnorm_topk":
+                use_cached_non_rd = False
+                cache_mode = None
+                if wire_cache_mode == "read" and wire_cache_dir and wire_cache_key and wire_enabled:
+                    cache_mode = wire_quant_mode
+                    if not cache_mode and self.kv_quant_config and self.kv_quant_config.get("enabled", False):
+                        scheme = resolve_scheme(self.kv_quant_config, target_layer_idx)
+                        if scheme and scheme.lower() in ("int8", "int4"):
+                            cache_mode = scheme.lower()
+                    if cache_mode in ("int8", "int4"):
+                        cached_non_rd = _load_wire_blob(_wire_cache_path("all", cache_mode))
+                        if cached_non_rd:
+                            use_cached_non_rd = True
+                            cached_non_rd_decode_ms = float(cached_non_rd[2])
+                            cached_non_rd_breakdown = cached_non_rd[3]
+                        elif source_kv_cache is None:
+                            raise RuntimeError("wire_cache_mode=read but no cached blob found")
+                if use_cached_non_rd:
+                    idx = cached_non_rd[1] if cached_non_rd else torch.empty((0,), device=base_key_cache.device, dtype=torch.long)
+                    stats = {"selected_tokens": int(idx.numel()), "total_tokens": int(seq_len)}
+                    if stats["total_tokens"] > 0:
+                        stats["selected_fraction"] = float(stats["selected_tokens"] / stats["total_tokens"])
+                elif mode == "proj_vnorm_topk":
                     # Project full KV once to score in receiver space (projector-aware).
                     _sync()
                     t_score = time.perf_counter()
@@ -950,6 +1108,8 @@ class RosettaModel(nn.Module):
                     "wire_encode_time_sum_ms": 0.0,
                     "wire_decode_time_sum_ms": 0.0,
                 })
+                if cached_non_rd_breakdown:
+                    _apply_wire_breakdown(extra_stats, cached_non_rd_breakdown, 0.0, cached_non_rd_decode_ms)
 
             if idx.numel() == 0:
                 self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
@@ -976,7 +1136,10 @@ class RosettaModel(nn.Module):
                         target_layer_idx,
                     )
                     mode = wire_mode or wire_quant_mode or "int8"
-                    _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx, mode, apply_decoded=False)
+                    cache_path = _wire_cache_path("all", mode) if wire_cache_mode == "write" else None
+                    _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(
+                        source_sel_q, idx, mode, apply_decoded=False, cache_path=cache_path
+                    )
                     _apply_wire_breakdown(extra_stats, breakdown, enc_ms, dec_ms)
                 self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (proj_key_out, proj_val_out), q_info_full
@@ -991,13 +1154,23 @@ class RosettaModel(nn.Module):
                 )
                 _sync()
                 t_proj = time.perf_counter()
-                source_sel, q_info = maybe_quantize_kv_with_layer(
-                    source_sel,
-                    self.kv_quant_config,
-                    target_layer_idx,
-                )
-                mode = wire_mode or wire_quant_mode or "int8"
-                source_sel, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel, idx, mode)
+                if cached_non_rd is not None:
+                    source_sel = cached_non_rd[0]
+                    q_info = {"cached": True}
+                    enc_ms = 0.0
+                    dec_ms = cached_non_rd_decode_ms
+                    breakdown = cached_non_rd_breakdown
+                else:
+                    source_sel, q_info = maybe_quantize_kv_with_layer(
+                        source_sel,
+                        self.kv_quant_config,
+                        target_layer_idx,
+                    )
+                    mode = wire_mode or wire_quant_mode or "int8"
+                    cache_path = _wire_cache_path("all", mode) if wire_cache_mode == "write" else None
+                    source_sel, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(
+                        source_sel, idx, mode, cache_path=cache_path
+                    )
                 proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
                 _sync()
                 projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
@@ -1020,14 +1193,24 @@ class RosettaModel(nn.Module):
             idx = idx.to(device=key_cache.device)
             mask[:, :, idx, :] = True
             mask = mask.expand_as(base_key_cache)
-            source_masked = (key_cache * mask, value_cache * mask)
+            if cached_non_rd is not None:
+                zero_k = torch.zeros_like(base_key_cache)
+                zero_v = torch.zeros_like(base_value_cache)
+                zero_k[:, :, idx, :] = cached_non_rd[0][0]
+                zero_v[:, :, idx, :] = cached_non_rd[0][1]
+                source_masked = (zero_k, zero_v)
+            else:
+                source_masked = (key_cache * mask, value_cache * mask)
             _sync()
             t_proj = time.perf_counter()
-            source_masked, q_info = maybe_quantize_kv_with_layer(
-                source_masked,
-                self.kv_quant_config,
-                target_layer_idx,
-            )
+            if cached_non_rd is None:
+                source_masked, q_info = maybe_quantize_kv_with_layer(
+                    source_masked,
+                    self.kv_quant_config,
+                    target_layer_idx,
+                )
+            else:
+                q_info = {"cached": True}
             proj_key_full, proj_val_full = projector.forward(source_masked, base_kv_cache)
             _sync()
             projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
@@ -1042,7 +1225,7 @@ class RosettaModel(nn.Module):
                 fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
             extra_stats["projection_transfer_time_sum_ms"] = projection_transfer_time_ms
             extra_stats["fuse_time_sum_ms"] = fuse_time_ms
-            if wire_enabled and wire_apply_pack and idx.numel() > 0:
+            if wire_enabled and wire_apply_pack and idx.numel() > 0 and cached_non_rd is None:
                 source_sel = (
                     key_cache[:, :, idx, :],
                     value_cache[:, :, idx, :],
@@ -1053,7 +1236,10 @@ class RosettaModel(nn.Module):
                     target_layer_idx,
                 )
                 mode = wire_mode or wire_quant_mode or "int8"
-                _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx, mode, apply_decoded=False)
+                cache_path = _wire_cache_path("all", mode) if wire_cache_mode == "write" else None
+                _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(
+                    source_sel_q, idx, mode, apply_decoded=False, cache_path=cache_path
+                )
                 _apply_wire_breakdown(extra_stats, breakdown, enc_ms, dec_ms)
             self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
             return (proj_key_full, proj_val_full), q_info
@@ -1459,44 +1645,50 @@ class RosettaModel(nn.Module):
                         source_prefill_input_ids = prefill_input_ids
                         source_prefill_attention_mask = prefill_attention_mask
 
-                    model = self.model_list[source_model_idx]
-                    moved = False
-                    orig_device = getattr(model, "device", None)
-                    target_device = base_input_ids.device
-                    if self.exec_mode == "sequential" and orig_device is not None and orig_device != target_device:
-                        model.to(target_device)
-                        moved = True
-                    was_training = model.training
-                    had_gc = getattr(model, "is_gradient_checkpointing", False)
+                    curr_source_kv_cache = None
+                    skip_source_forward = transfer_enabled and wire_cache_mode == "read" and wire_cache_dir
+                    if not skip_source_forward:
+                        model = self.model_list[source_model_idx]
+                        moved = False
+                        orig_device = getattr(model, "device", None)
+                        target_device = base_input_ids.device
+                        if self.exec_mode == "sequential" and orig_device is not None and orig_device != target_device:
+                            model.to(target_device)
+                            moved = True
+                        was_training = model.training
+                        had_gc = getattr(model, "is_gradient_checkpointing", False)
 
-                    try:
-                        if was_training:
-                            model.eval()
-                        if had_gc:
-                            model.gradient_checkpointing_disable()
+                        try:
+                            if was_training:
+                                model.eval()
+                            if had_gc:
+                                model.gradient_checkpointing_disable()
 
-                        with torch.no_grad():
-                            out = model(
-                                input_ids=source_prefill_input_ids,
-                                attention_mask=source_prefill_attention_mask,
-                                position_ids=prefill_position_ids,
-                                past_key_values=self.kv_cache_dict[self.base_model_idx][source_model_idx],
-                                use_cache=True,
-                                return_dict=True,
-                            )
-                            curr_source_kv_cache = out.past_key_values
-                    finally:
-                        if had_gc:
-                            model.gradient_checkpointing_enable()
-                        if was_training:
-                            model.train()
-                        if moved and orig_device is not None:
-                            model.to(orig_device)
-                            if target_device.type == "cuda":
-                                torch.cuda.empty_cache()
-                    
-                    curr_source_kv_cache = hybrid_to_dynamic(curr_source_kv_cache)
-                    self.kv_cache_dict[self.base_model_idx][source_model_idx] = clone_kv_cache(curr_source_kv_cache)
+                            with torch.no_grad():
+                                out = model(
+                                    input_ids=source_prefill_input_ids,
+                                    attention_mask=source_prefill_attention_mask,
+                                    position_ids=prefill_position_ids,
+                                    past_key_values=self.kv_cache_dict[self.base_model_idx][source_model_idx],
+                                    use_cache=True,
+                                    return_dict=True,
+                                )
+                                curr_source_kv_cache = out.past_key_values
+                        finally:
+                            if had_gc:
+                                model.gradient_checkpointing_enable()
+                            if was_training:
+                                model.train()
+                            if moved and orig_device is not None:
+                                model.to(orig_device)
+                                if target_device.type == "cuda":
+                                    torch.cuda.empty_cache()
+
+                    if curr_source_kv_cache is None:
+                        self.kv_cache_dict[self.base_model_idx][source_model_idx] = None
+                    else:
+                        curr_source_kv_cache = hybrid_to_dynamic(curr_source_kv_cache)
+                        self.kv_cache_dict[self.base_model_idx][source_model_idx] = clone_kv_cache(curr_source_kv_cache)
 
                 # calculate source model kvcache and apply projections
                 if self.base_model_idx in self.projector_dict:
@@ -1510,6 +1702,8 @@ class RosettaModel(nn.Module):
                         transfer_mode = (self.kv_transfer_config.get("token_select_mode") or "").lower() if transfer_enabled else ""
                         token_precision_mode = (self.kv_transfer_config.get("token_precision_mode") or "").lower() if transfer_enabled else ""
                         transfer_cache_needs_target = transfer_mode in {"proj_vnorm_topk", "delta_proj_vnorm_topk"} or token_precision_mode == "rd_greedy"
+                        wire_cache_mode = (self.kv_transfer_config.get("wire_cache_mode") or "off").lower() if transfer_enabled else "off"
+                        wire_cache_dir = self.kv_transfer_config.get("wire_cache_dir") if transfer_enabled else None
 
                         scope_mask = None
                         if transfer_enabled:
@@ -1530,6 +1724,8 @@ class RosettaModel(nn.Module):
                             # Check if this sharer is selected: bit (source_model_idx - 1)
                             if not (sharer_mask & (1 << (source_model_idx - 1))):
                                 continue
+                            if transfer_enabled and wire_cache_dir:
+                                self.kv_transfer_config["wire_cache_suffix"] = f"src{source_model_idx}"
                             if self.multi_source_fusion_mode == "sequential":
                                 base_cache_ref = curr_base_kv_cache
                             else:
@@ -1552,10 +1748,14 @@ class RosettaModel(nn.Module):
                                     transfer_cache_key = (
                                         (source_model_layer_idx, target_layer_idx) if transfer_cache_needs_target else cache_key
                                     )
-                                    source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
-                                    new_source_key_cache = source_key_cache[:, :, start:end, :]
-                                    new_source_value_cache = source_value_cache[:, :, start:end, :]
-                                    new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                    source_cache_store = self.kv_cache_dict[self.base_model_idx][source_model_idx]
+                                    if source_cache_store is None:
+                                        new_source_kv_cache = None
+                                    else:
+                                        source_key_cache, source_value_cache = source_cache_store[source_model_layer_idx]
+                                        new_source_key_cache = source_key_cache[:, :, start:end, :]
+                                        new_source_value_cache = source_value_cache[:, :, start:end, :]
+                                        new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
 
                                     if transfer_enabled:
                                         (projected_key, projected_value), q_info = self._project_with_transfer(
