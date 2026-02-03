@@ -13,7 +13,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import json
 
 from rosetta.model.projector import Projector
-from rosetta.utils.quant import maybe_quantize_kv_with_layer, quantize_kv
+from rosetta.utils.quant import maybe_quantize_kv_with_layer, quantize_kv, resolve_scheme, NO_QUANT_SCHEMES
 from rosetta.utils.kv_select import select_token_indices, select_topk
 from rosetta.model.sampling import sample_token
 from transformers.utils import ModelOutput
@@ -22,6 +22,19 @@ try:
 except Exception:
     GreedySearchDecoderOnlyOutput = None
     SampleDecoderOnlyOutput = None
+
+try:
+    from quantization.kvwire.kvwire_v1 import (
+        KVWireConfig,
+        pack as kvwire_pack,
+        unpack as kvwire_unpack,
+        pack_with_breakdown as kvwire_pack_with_breakdown,
+    )
+except Exception:
+    KVWireConfig = None
+    kvwire_pack = None
+    kvwire_unpack = None
+    kvwire_pack_with_breakdown = None
 
 def clone_kv_cache(kv_cache: DynamicCache) -> DynamicCache:
         new_cache = DynamicCache()
@@ -94,6 +107,11 @@ class RosettaModel(nn.Module):
         self.multi_source_fusion_mode = multi_source_fusion_mode
         self.kv_quant_config = kv_quant_config or {"enabled": False}
         self.kv_transfer_config = kv_transfer_config or {"enabled": False}
+        self.exec_mode = (self.kv_transfer_config.get("exec_mode") or "simultaneous").lower()
+        if self.exec_mode not in ["simultaneous", "sequential"]:
+            raise ValueError(f"exec_mode must be 'simultaneous' or 'sequential', got '{self.exec_mode}'")
+        record_per_sample = bool(self.kv_transfer_config.get("record_per_sample", False))
+        sample_limit = int(self.kv_transfer_config.get("sample_limit", 0) or 0)
         if self.kv_quant_config.get("collect_stats", False):
             self._kv_quant_stats = {
                 "count": 0,
@@ -132,6 +150,20 @@ class RosettaModel(nn.Module):
                 "rd_payload_bytes_sum": 0.0,
                 "rd_index_bytes_sum": 0.0,
                 "rd_scale_bytes_sum": 0.0,
+                "wire_bytes_sum": 0.0,
+                "wire_payload_bytes_sum": 0.0,
+                "wire_index_bytes_sum": 0.0,
+                "wire_scale_bytes_sum": 0.0,
+                "wire_header_bytes_sum": 0.0,
+                "wire_encode_time_sum_ms": 0.0,
+                "wire_decode_time_sum_ms": 0.0,
+                "budget_cap_bytes_sum": 0.0,
+                "budget_actual_bytes_sum": 0.0,
+                "budget_slack_bytes_sum": 0.0,
+                "record_per_sample": record_per_sample,
+                "sample_limit": sample_limit,
+                "sample_records": [],
+                "sample_accum": None,
             }
         else:
             self._kv_transfer_stats = None
@@ -269,6 +301,7 @@ class RosettaModel(nn.Module):
         if self._kv_transfer_stats is None:
             return None
         stats = dict(self._kv_transfer_stats)
+        stats.pop("sample_accum", None)
         count = stats.get("count", 0)
         if count > 0:
             stats["selected_mean"] = stats["selected_sum"] / stats["count"]
@@ -294,6 +327,17 @@ class RosettaModel(nn.Module):
             stats["rd_payload_bytes_mean"] = stats.get("rd_payload_bytes_sum", 0.0) / count
             stats["rd_index_bytes_mean"] = stats.get("rd_index_bytes_sum", 0.0) / count
             stats["rd_scale_bytes_mean"] = stats.get("rd_scale_bytes_sum", 0.0) / count
+            stats["wire_bytes_mean"] = stats.get("wire_bytes_sum", 0.0) / count
+            stats["wire_payload_bytes_mean"] = stats.get("wire_payload_bytes_sum", 0.0) / count
+            stats["wire_index_bytes_mean"] = stats.get("wire_index_bytes_sum", 0.0) / count
+            stats["wire_scale_bytes_mean"] = stats.get("wire_scale_bytes_sum", 0.0) / count
+            stats["wire_header_bytes_mean"] = stats.get("wire_header_bytes_sum", 0.0) / count
+            stats["wire_encode_time_mean_ms"] = stats.get("wire_encode_time_sum_ms", 0.0) / count
+            stats["wire_decode_time_mean_ms"] = stats.get("wire_decode_time_sum_ms", 0.0) / count
+            if stats.get("prefill_count", 0) > 0:
+                stats["budget_cap_bytes_mean"] = stats.get("budget_cap_bytes_sum", 0.0) / stats["prefill_count"]
+                stats["budget_actual_bytes_mean"] = stats.get("budget_actual_bytes_sum", 0.0) / stats["prefill_count"]
+                stats["budget_slack_bytes_mean"] = stats.get("budget_slack_bytes_sum", 0.0) / stats["prefill_count"]
         return stats
 
     def _update_kv_transfer_stats(self, selected_tokens: int, total_tokens: int, extra: Optional[dict] = None):
@@ -309,6 +353,10 @@ class RosettaModel(nn.Module):
         stats["selected_max"] = (
             selected_tokens if stats["selected_max"] is None else max(stats["selected_max"], selected_tokens)
         )
+        sample_accum = stats.get("sample_accum")
+        if sample_accum is not None:
+            sample_accum["selected_tokens"] += int(selected_tokens)
+            sample_accum["total_tokens"] += int(total_tokens)
         if extra:
             for key, value in extra.items():
                 if value is None:
@@ -319,6 +367,23 @@ class RosettaModel(nn.Module):
                     stats[key] = value if stats.get(key) is None else max(stats[key], value)
                 else:
                     stats[key] = stats.get(key, 0) + value
+                if sample_accum is not None:
+                    if key == "wire_bytes_sum":
+                        sample_accum["wire_bytes"] += float(value)
+                    elif key == "wire_payload_bytes_sum":
+                        sample_accum["wire_payload_bytes"] += float(value)
+                    elif key == "wire_index_bytes_sum":
+                        sample_accum["wire_index_bytes"] += float(value)
+                    elif key == "wire_scale_bytes_sum":
+                        sample_accum["wire_scale_bytes"] += float(value)
+                    elif key == "wire_header_bytes_sum":
+                        sample_accum["wire_header_bytes"] += float(value)
+                    elif key == "rd_int8_sum":
+                        sample_accum["rd_int8"] += int(value)
+                    elif key == "rd_int4_sum":
+                        sample_accum["rd_int4"] += int(value)
+                    elif key == "rd_drop_sum":
+                        sample_accum["rd_drop"] += int(value)
 
     def _update_prefill_stats(self, prefill_time_ms: float):
         if self._kv_transfer_stats is None:
@@ -326,6 +391,59 @@ class RosettaModel(nn.Module):
         stats = self._kv_transfer_stats
         stats["prefill_count"] = stats.get("prefill_count", 0) + 1
         stats["prefill_time_sum_ms"] = stats.get("prefill_time_sum_ms", 0.0) + float(prefill_time_ms)
+
+    def _start_transfer_sample(self):
+        if self._kv_transfer_stats is None:
+            return
+        stats = self._kv_transfer_stats
+        if not stats.get("record_per_sample", False):
+            return
+        stats["sample_accum"] = {
+            "selected_tokens": 0,
+            "total_tokens": 0,
+            "wire_bytes": 0.0,
+            "wire_payload_bytes": 0.0,
+            "wire_index_bytes": 0.0,
+            "wire_scale_bytes": 0.0,
+            "wire_header_bytes": 0.0,
+            "rd_int8": 0,
+            "rd_int4": 0,
+            "rd_drop": 0,
+        }
+
+    def _finalize_transfer_sample(self):
+        if self._kv_transfer_stats is None:
+            return
+        stats = self._kv_transfer_stats
+        if not stats.get("record_per_sample", False):
+            return
+        accum = stats.get("sample_accum")
+        if not accum:
+            return
+        budget_cap = self.kv_transfer_config.get("wire_budget_bytes")
+        budget_cap = float(budget_cap) if budget_cap is not None else None
+        actual = float(accum.get("wire_bytes", 0.0))
+        slack = None
+        if budget_cap is not None:
+            slack = budget_cap - actual
+            if slack < 0:
+                slack = 0.0
+            stats["budget_cap_bytes_sum"] = stats.get("budget_cap_bytes_sum", 0.0) + float(budget_cap)
+            stats["budget_actual_bytes_sum"] = stats.get("budget_actual_bytes_sum", 0.0) + float(actual)
+            stats["budget_slack_bytes_sum"] = stats.get("budget_slack_bytes_sum", 0.0) + float(slack)
+
+        record = dict(accum)
+        if budget_cap is not None:
+            record["budget_cap_bytes"] = float(budget_cap)
+            record["budget_actual_bytes"] = float(actual)
+            record["budget_slack_bytes"] = float(slack or 0.0)
+
+        sample_records = stats.get("sample_records")
+        sample_limit = int(stats.get("sample_limit", 0) or 0)
+        if isinstance(sample_records, list):
+            if sample_limit <= 0 or len(sample_records) < sample_limit:
+                sample_records.append(record)
+        stats["sample_accum"] = None
 
     def _project_with_transfer(
         self,
@@ -376,6 +494,109 @@ class RosettaModel(nn.Module):
             if axis == "head":
                 return float(2 * heads * 4)
             return float(2 * 4)
+
+        wire_format = (transfer_cfg.get("wire_format") or "").lower()
+        wire_enabled = wire_format == "kvwire_v1"
+        wire_apply_pack = bool(transfer_cfg.get("wire_apply_pack", False))
+        wire_quant_mode = (transfer_cfg.get("wire_quant_mode") or "").lower()
+        wire_scale_granularity = (transfer_cfg.get("wire_scale_granularity") or "per_block").lower()
+        wire_scale_dtype = (transfer_cfg.get("wire_scale_dtype") or "fp16").lower()
+        wire_include_headers = bool(transfer_cfg.get("wire_include_headers", True))
+        wire_index_bytes = float(transfer_cfg.get("wire_index_dtype_bytes") or transfer_cfg.get("index_dtype_bytes") or 0.0)
+
+        def _wire_payload_bytes(token_count: int, quant_mode: str) -> float:
+            if token_count <= 0:
+                return 0.0
+            batch = int(key_cache.shape[0])
+            heads = int(key_cache.shape[1])
+            head_dim = int(key_cache.shape[3])
+            elems = batch * heads * token_count * head_dim * 2
+            mode = (quant_mode or "int8").lower()
+            if mode == "int4":
+                return float((elems + 1) // 2)
+            if mode == "int8":
+                return float(elems)
+            if mode in ("fp16", "bf16"):
+                return float(elems * 2)
+            return float(elems)
+
+        def _wire_scale_bytes(token_count: int) -> float:
+            if token_count <= 0:
+                return 0.0
+            batch = int(key_cache.shape[0])
+            heads = int(key_cache.shape[1])
+            scale_bytes = 2 if wire_scale_dtype in ("fp16", "bf16", "bfloat16") else 4
+            if wire_scale_granularity == "per_block":
+                scale_count = 2 * batch * heads * token_count
+            elif wire_scale_granularity == "per_head":
+                scale_count = 2 * batch * heads
+            else:  # per_tensor/per_layer
+                scale_count = 2
+            return float(scale_count * scale_bytes)
+
+        def _estimate_wire_header_bytes(token_count: int, payload_bytes: float, scale_bytes: float, index_bytes: float) -> float:
+            if not wire_enabled or not wire_include_headers:
+                return 0.0
+            meta = {
+                "version": "kvwire_v1",
+                "quant_mode": wire_quant_mode or "int8",
+                "index_dtype_bytes": int(wire_index_bytes),
+                "scale_dtype": wire_scale_dtype,
+                "scale_granularity": wire_scale_granularity,
+                "tokens": int(token_count),
+                "sections": {
+                    "indices": int(index_bytes),
+                    "payload": int(payload_bytes),
+                    "scales": int(scale_bytes),
+                },
+            }
+            payload = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+            return float(12 + len(payload))
+
+        def _maybe_apply_wire_pack(source_sel, indices, quant_mode: str, apply_decoded: bool = True):
+            if not wire_enabled:
+                return source_sel, 0.0, 0.0, None
+            if not wire_apply_pack:
+                return source_sel, 0.0, 0.0, None
+            if KVWireConfig is None or kvwire_pack_with_breakdown is None or kvwire_unpack is None:
+                return source_sel, 0.0, 0.0, None
+            try:
+                k_np = source_sel[0].detach().cpu().numpy()
+                v_np = source_sel[1].detach().cpu().numpy()
+                idx_np = indices.detach().cpu().numpy() if indices is not None else None
+                cfg = KVWireConfig(
+                    wire_index_dtype=transfer_cfg.get("wire_index_dtype", "uint16"),
+                    wire_scale_dtype=wire_scale_dtype,
+                    wire_quant_mode=quant_mode,
+                    wire_scale_granularity=wire_scale_granularity,
+                    wire_include_headers=wire_include_headers,
+                    wire_version="kvwire_v1",
+                    wire_compression=transfer_cfg.get("wire_compression", "none"),
+                )
+                t_encode = time.perf_counter()
+                blob, breakdown = kvwire_pack_with_breakdown({"k": k_np, "v": v_np, "indices": idx_np}, cfg)
+                encode_ms = (time.perf_counter() - t_encode) * 1000.0
+                t_decode = time.perf_counter()
+                decoded = kvwire_unpack(blob, cfg)
+                decode_ms = (time.perf_counter() - t_decode) * 1000.0
+                if apply_decoded:
+                    k_dec = torch.from_numpy(decoded["k"]).to(device=source_sel[0].device, dtype=source_sel[0].dtype)
+                    v_dec = torch.from_numpy(decoded["v"]).to(device=source_sel[1].device, dtype=source_sel[1].dtype)
+                    return (k_dec, v_dec), encode_ms, decode_ms, breakdown
+                return source_sel, encode_ms, decode_ms, breakdown
+            except Exception:
+                return source_sel, 0.0, 0.0, None
+
+        def _apply_wire_breakdown(extra_stats: dict, breakdown: Optional[dict], encode_ms: float, decode_ms: float):
+            if not breakdown:
+                return
+            extra_stats["wire_bytes_sum"] = float(breakdown.get("total_bytes", 0.0))
+            extra_stats["wire_payload_bytes_sum"] = float(breakdown.get("payload_bytes", 0.0))
+            extra_stats["wire_index_bytes_sum"] = float(breakdown.get("index_bytes", 0.0))
+            extra_stats["wire_scale_bytes_sum"] = float(breakdown.get("scale_bytes", 0.0))
+            extra_stats["wire_header_bytes_sum"] = float(breakdown.get("header_bytes", 0.0))
+            extra_stats["wire_encode_time_sum_ms"] = float(encode_ms)
+            extra_stats["wire_decode_time_sum_ms"] = float(decode_ms)
 
         def _score_stats(scores: torch.Tensor, idx_tensor: torch.Tensor) -> dict:
             if idx_tensor is None or idx_tensor.numel() == 0:
@@ -480,6 +701,14 @@ class RosettaModel(nn.Module):
                 },
                 "rd_budget_bytes": float(budget_bytes),
             }
+            wire_encode_ms = 0.0
+            wire_decode_ms = 0.0
+            wire_payload_bytes = 0.0
+            wire_index_bytes = 0.0
+            wire_scale_bytes = 0.0
+            wire_header_bytes = 0.0
+            wire_total_bytes = 0.0
+            wire_used_breakdown = False
 
             if idx_int8:
                 idx_tensor = torch.tensor(idx_int8, device=key_cache.device, dtype=torch.long)
@@ -488,6 +717,16 @@ class RosettaModel(nn.Module):
                 _sync()
                 t_proj = time.perf_counter()
                 source_sel_q, q_info8 = quantize_kv(source_sel, scheme="int8", axis=axis, eps=eps, collect_stats=collect_stats)
+                source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int8")
+                wire_encode_ms += enc_ms
+                wire_decode_ms += dec_ms
+                if breakdown:
+                    wire_used_breakdown = True
+                    wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                    wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                    wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                    wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                    wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
                 proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
                 _sync()
                 projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
@@ -506,6 +745,16 @@ class RosettaModel(nn.Module):
                 _sync()
                 t_proj = time.perf_counter()
                 source_sel_q, q_info4 = quantize_kv(source_sel, scheme="int4", axis=axis, eps=eps, collect_stats=collect_stats)
+                source_sel_q, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx_tensor, "int4")
+                wire_encode_ms += enc_ms
+                wire_decode_ms += dec_ms
+                if breakdown:
+                    wire_used_breakdown = True
+                    wire_payload_bytes += float(breakdown.get("payload_bytes", 0.0))
+                    wire_index_bytes += float(breakdown.get("index_bytes", 0.0))
+                    wire_scale_bytes += float(breakdown.get("scale_bytes", 0.0))
+                    wire_header_bytes += float(breakdown.get("header_bytes", 0.0))
+                    wire_total_bytes += float(breakdown.get("total_bytes", 0.0))
                 proj_key_sel, proj_val_sel = projector.forward(source_sel_q, base_sel)
                 _sync()
                 projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
@@ -555,6 +804,32 @@ class RosettaModel(nn.Module):
                 "rd_index_bytes_sum": float(index_bytes_total),
                 "rd_scale_bytes_sum": float(scale_bytes_total),
             }
+            if wire_enabled:
+                if wire_used_breakdown:
+                    extra_stats.update({
+                        "wire_bytes_sum": float(wire_total_bytes),
+                        "wire_payload_bytes_sum": float(wire_payload_bytes),
+                        "wire_index_bytes_sum": float(wire_index_bytes),
+                        "wire_scale_bytes_sum": float(wire_scale_bytes),
+                        "wire_header_bytes_sum": float(wire_header_bytes),
+                        "wire_encode_time_sum_ms": float(wire_encode_ms),
+                        "wire_decode_time_sum_ms": float(wire_decode_ms),
+                    })
+                else:
+                    wire_payload = _wire_payload_bytes(len(idx_int8), "int8") + _wire_payload_bytes(len(idx_int4), "int4")
+                    wire_index = float(len(idx_int8) + len(idx_int4)) * wire_index_bytes
+                    wire_scale = _wire_scale_bytes(len(idx_int8) + len(idx_int4))
+                    wire_header = _estimate_wire_header_bytes(len(idx_int8) + len(idx_int4), wire_payload, wire_scale, wire_index)
+                    wire_total = wire_payload + wire_index + wire_scale + wire_header
+                    extra_stats.update({
+                        "wire_bytes_sum": float(wire_total),
+                        "wire_payload_bytes_sum": float(wire_payload),
+                        "wire_index_bytes_sum": float(wire_index),
+                        "wire_scale_bytes_sum": float(wire_scale),
+                        "wire_header_bytes_sum": float(wire_header),
+                        "wire_encode_time_sum_ms": 0.0,
+                        "wire_decode_time_sum_ms": 0.0,
+                    })
             if score_stats:
                 extra_stats["score_mean_sum"] = score_stats.get("score_mean", 0.0)
                 if score_stats.get("score_min") is not None:
@@ -649,6 +924,33 @@ class RosettaModel(nn.Module):
             if stats.get("score_max") is not None:
                 extra_stats["score_max"] = float(stats.get("score_max"))
 
+            wire_mode = None
+            if wire_enabled:
+                mode = wire_quant_mode
+                if not mode:
+                    if self.kv_quant_config and self.kv_quant_config.get("enabled", False):
+                        scheme = resolve_scheme(self.kv_quant_config, target_layer_idx)
+                        mode = scheme.lower() if scheme else "int8"
+                        if mode in NO_QUANT_SCHEMES:
+                            mode = "fp16"
+                    else:
+                        mode = "fp16"
+                wire_mode = mode
+                wire_payload = _wire_payload_bytes(stats["selected_tokens"], mode)
+                wire_index = float(stats["selected_tokens"]) * wire_index_bytes
+                wire_scale = _wire_scale_bytes(stats["selected_tokens"])
+                wire_header = _estimate_wire_header_bytes(stats["selected_tokens"], wire_payload, wire_scale, wire_index)
+                wire_total = wire_payload + wire_index + wire_scale + wire_header
+                extra_stats.update({
+                    "wire_bytes_sum": float(wire_total),
+                    "wire_payload_bytes_sum": float(wire_payload),
+                    "wire_index_bytes_sum": float(wire_index),
+                    "wire_scale_bytes_sum": float(wire_scale),
+                    "wire_header_bytes_sum": float(wire_header),
+                    "wire_encode_time_sum_ms": 0.0,
+                    "wire_decode_time_sum_ms": 0.0,
+                })
+
             if idx.numel() == 0:
                 self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (base_key_cache, base_value_cache), None
@@ -666,6 +968,16 @@ class RosettaModel(nn.Module):
                 _sync()
                 fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+                if wire_enabled and wire_apply_pack and idx.numel() > 0:
+                    source_sel = (key_cache[:, :, idx, :], value_cache[:, :, idx, :])
+                    source_sel_q, _ = maybe_quantize_kv_with_layer(
+                        source_sel,
+                        self.kv_quant_config,
+                        target_layer_idx,
+                    )
+                    mode = wire_mode or wire_quant_mode or "int8"
+                    _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx, mode, apply_decoded=False)
+                    _apply_wire_breakdown(extra_stats, breakdown, enc_ms, dec_ms)
                 self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (proj_key_out, proj_val_out), q_info_full
             else:
@@ -684,6 +996,8 @@ class RosettaModel(nn.Module):
                     self.kv_quant_config,
                     target_layer_idx,
                 )
+                mode = wire_mode or wire_quant_mode or "int8"
+                source_sel, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel, idx, mode)
                 proj_key_sel, proj_val_sel = projector.forward(source_sel, base_sel)
                 _sync()
                 projection_transfer_time_ms += (time.perf_counter() - t_proj) * 1000.0
@@ -697,6 +1011,7 @@ class RosettaModel(nn.Module):
                 fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
                 extra_stats["projection_transfer_time_sum_ms"] = projection_transfer_time_ms
                 extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+                _apply_wire_breakdown(extra_stats, breakdown, enc_ms, dec_ms)
                 self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
                 return (proj_key_full, proj_val_full), q_info
 
@@ -727,6 +1042,19 @@ class RosettaModel(nn.Module):
                 fuse_time_ms += (time.perf_counter() - t_fuse) * 1000.0
             extra_stats["projection_transfer_time_sum_ms"] = projection_transfer_time_ms
             extra_stats["fuse_time_sum_ms"] = fuse_time_ms
+            if wire_enabled and wire_apply_pack and idx.numel() > 0:
+                source_sel = (
+                    key_cache[:, :, idx, :],
+                    value_cache[:, :, idx, :],
+                )
+                source_sel_q, _ = maybe_quantize_kv_with_layer(
+                    source_sel,
+                    self.kv_quant_config,
+                    target_layer_idx,
+                )
+                mode = wire_mode or wire_quant_mode or "int8"
+                _, enc_ms, dec_ms, breakdown = _maybe_apply_wire_pack(source_sel_q, idx, mode, apply_decoded=False)
+                _apply_wire_breakdown(extra_stats, breakdown, enc_ms, dec_ms)
             self._update_kv_transfer_stats(stats["selected_tokens"], stats["total_tokens"], extra=extra_stats)
             return (proj_key_full, proj_val_full), q_info
 
@@ -1132,6 +1460,12 @@ class RosettaModel(nn.Module):
                         source_prefill_attention_mask = prefill_attention_mask
 
                     model = self.model_list[source_model_idx]
+                    moved = False
+                    orig_device = getattr(model, "device", None)
+                    target_device = base_input_ids.device
+                    if self.exec_mode == "sequential" and orig_device is not None and orig_device != target_device:
+                        model.to(target_device)
+                        moved = True
                     was_training = model.training
                     had_gc = getattr(model, "is_gradient_checkpointing", False)
 
@@ -1156,6 +1490,10 @@ class RosettaModel(nn.Module):
                             model.gradient_checkpointing_enable()
                         if was_training:
                             model.train()
+                        if moved and orig_device is not None:
+                            model.to(orig_device)
+                            if target_device.type == "cuda":
+                                torch.cuda.empty_cache()
                     
                     curr_source_kv_cache = hybrid_to_dynamic(curr_source_kv_cache)
                     self.kv_cache_dict[self.base_model_idx][source_model_idx] = clone_kv_cache(curr_source_kv_cache)
@@ -1381,6 +1719,7 @@ class RosettaModel(nn.Module):
         # Prefill to build caches and obtain initial logits
         transfer_enabled = bool((self.kv_transfer_config or {}).get("enabled", False))
         if transfer_enabled:
+            self._start_transfer_sample()
             timing_sync = bool((self.kv_transfer_config or {}).get("timing_sync", False))
             if timing_sync and base_input_ids.is_cuda:
                 torch.cuda.synchronize(base_input_ids.device)
@@ -1398,6 +1737,7 @@ class RosettaModel(nn.Module):
             if timing_sync and base_input_ids.is_cuda:
                 torch.cuda.synchronize(base_input_ids.device)
             self._update_prefill_stats((time.perf_counter() - t_prefill) * 1000.0)
+            self._finalize_transfer_sample()
         else:
             prefill_output = self.forward(
                 kv_cache_index=kv_cache_index,

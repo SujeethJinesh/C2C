@@ -272,6 +272,12 @@ class UnifiedEvaluator:
         # Debug options
         self.debug_dump_bad_samples = bool(self.eval_config.get("debug_dump_bad_samples", True))
         self.cuda_launch_blocking = bool(self.eval_config.get("cuda_launch_blocking", False))
+
+        # Long-context configuration (optional)
+        self.long_context_cfg = self.eval_config.get("long_context", {}) or {}
+        self.long_context_enabled = bool(self.long_context_cfg.get("enabled", False))
+        self.long_context_chunks = None
+        self.long_context_corpus_version = self.long_context_cfg.get("corpus_version")
         
         # Check if using two-stage based on model_name
         self.use_two_stage = self.model_config["model_name"].lower() in ["two_stage", "two_stage_rosetta"]
@@ -317,6 +323,70 @@ class UnifiedEvaluator:
             except Exception:
                 kv_transfer_stats = None
         return kv_quant_stats, kv_transfer_stats
+
+    def _load_long_context_chunks(self):
+        if not self.long_context_enabled:
+            return []
+        if self.long_context_chunks is not None:
+            return self.long_context_chunks
+        corpus_path = self.long_context_cfg.get("corpus_path")
+        if not corpus_path:
+            self.long_context_chunks = []
+            return self.long_context_chunks
+        chunks = []
+        try:
+            with open(corpus_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("{") and line.endswith("}"):
+                        try:
+                            obj = json.loads(line)
+                            text = obj.get("text") if isinstance(obj, dict) else None
+                        except Exception:
+                            text = None
+                    else:
+                        text = line
+                    if text:
+                        chunks.append(text)
+        except Exception:
+            chunks = []
+        self.long_context_chunks = chunks
+        return chunks
+
+    def _maybe_extend_prompt(self, prompt: str, tokenizer, seed_key: Optional[str] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+        if not self.long_context_enabled:
+            return prompt, None
+        target_tokens = int(self.long_context_cfg.get("target_tokens", 0) or 0)
+        if target_tokens <= 0:
+            return prompt, None
+        chunks = self._load_long_context_chunks()
+        if not chunks:
+            return prompt, None
+        seed_source = str(seed_key) if seed_key is not None else "0"
+        seed = int(hashlib.md5(seed_source.encode("utf-8")).hexdigest(), 16) % (2**31)
+        rng = random.Random(seed)
+        extra_parts = []
+        base_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+        current_tokens = base_tokens
+        max_iters = max(len(chunks), 1) * 3
+        iters = 0
+        while current_tokens < target_tokens and iters < max_iters:
+            iters += 1
+            extra_parts.append(chunks[rng.randrange(len(chunks))])
+            candidate = prompt + "\n\n" + "\n".join(extra_parts)
+            current_tokens = len(tokenizer.encode(candidate, add_special_tokens=False))
+        extended = prompt if not extra_parts else candidate
+        meta = {
+            "long_context_enabled": True,
+            "target_tokens": target_tokens,
+            "actual_tokens": current_tokens,
+            "base_tokens": base_tokens,
+            "longctx_seed": seed,
+            "corpus_version": self.long_context_corpus_version,
+        }
+        return extended, meta
 
     def _merge_stat_dict(self, base: Optional[Dict[str, Any]], new: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if new is None:
@@ -372,6 +442,17 @@ class UnifiedEvaluator:
             out["rd_payload_bytes_mean"] = out.get("rd_payload_bytes_sum", 0.0) / count
             out["rd_index_bytes_mean"] = out.get("rd_index_bytes_sum", 0.0) / count
             out["rd_scale_bytes_mean"] = out.get("rd_scale_bytes_sum", 0.0) / count
+            out["wire_bytes_mean"] = out.get("wire_bytes_sum", 0.0) / count
+            out["wire_payload_bytes_mean"] = out.get("wire_payload_bytes_sum", 0.0) / count
+            out["wire_index_bytes_mean"] = out.get("wire_index_bytes_sum", 0.0) / count
+            out["wire_scale_bytes_mean"] = out.get("wire_scale_bytes_sum", 0.0) / count
+            out["wire_header_bytes_mean"] = out.get("wire_header_bytes_sum", 0.0) / count
+            out["wire_encode_time_mean_ms"] = out.get("wire_encode_time_sum_ms", 0.0) / count
+            out["wire_decode_time_mean_ms"] = out.get("wire_decode_time_sum_ms", 0.0) / count
+            if out.get("prefill_count", 0):
+                out["budget_cap_bytes_mean"] = out.get("budget_cap_bytes_sum", 0.0) / out.get("prefill_count", 1)
+                out["budget_actual_bytes_mean"] = out.get("budget_actual_bytes_sum", 0.0) / out.get("prefill_count", 1)
+                out["budget_slack_bytes_mean"] = out.get("budget_slack_bytes_sum", 0.0) / out.get("prefill_count", 1)
         return out
 
     def _make_subject_splits(self, num_gpus: int) -> List[str]:
@@ -896,8 +977,8 @@ class UnifiedEvaluator:
 
     def prepare_model_inputs(self, prompt: str, tokenizer, device: torch.device,
                               model_type: str, llm_tokenizer: Optional[Any],
-                              answer_method: str, proportion: float = 1.0, 
-                              order_mode: str = "front"):
+                              answer_method: str, proportion: float = 1.0,
+                              order_mode: str = "front", example_id: Optional[str] = None):
         """
         Prepare model inputs (input_ids, attention_mask, position_ids, kv_cache_index) for
         both HF and Rosetta models, separated from the generation stage.
@@ -916,6 +997,7 @@ class UnifiedEvaluator:
         - kv_cache_index
         - printable_text (str): chat-formatted input text for logging
         """
+        prompt, longctx_meta = self._maybe_extend_prompt(prompt, tokenizer, seed_key=example_id)
         messages = [{"role": "user", "content": prompt}]
 
         use_aligner = (model_type == "rosetta") and (llm_tokenizer is not None)
@@ -953,6 +1035,8 @@ class UnifiedEvaluator:
                 },
                 "printable_text": text
             }
+            if longctx_meta is not None:
+                outputs["long_context_meta"] = longctx_meta
 
             if model_type == "rosetta":
                 full_length = input_ids.shape[1]
@@ -1053,6 +1137,8 @@ class UnifiedEvaluator:
                 },
                 "printable_text": (details["slm_text"], details["llm_text"])
             }
+            if longctx_meta is not None:
+                outputs["long_context_meta"] = longctx_meta
 
         return outputs
 
@@ -1313,7 +1399,8 @@ class UnifiedEvaluator:
                         llm_tokenizer=llm_tokenizer,
                         answer_method=self.eval_config["answer_method"],
                         proportion=proportion,
-                        order_mode=order_mode
+                        order_mode=order_mode,
+                        example_id=str(i)
                     )
                     
                     if self.eval_config["answer_method"] == 'logits':
